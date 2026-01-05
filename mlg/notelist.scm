@@ -110,7 +110,7 @@ events that assign instruments and PITCH_WHEEL events."
                                              (tg-percussion tonegen)
                                              (tg-velocity tonegen) ; start velocity
                                              velocity              ; end velocity
-                                             (sixth tonegen)       ; pitch bend
+                                             (tg-pitch-bend tonegen)       ; pitch bend
                                              ))))
                                     (set! toneList
                                           (assoc-remove! toneList (make-tg-hash track key)))))))]
