@@ -140,32 +140,25 @@ noteList from MIDI ticks to microseconds, properly handling tempo changes."
                   (let loop ([currentTick 0]
                              [timeInSeconds 0.0]
                              [tempoIdx 0])
-                    (if (>= tempoIdx (length tempoMap))
-                        ;; Beyond all tempo changes, use the last tempo
-                        (let* ([lastTempo (cdr (list-ref tempoMap (1- (length tempoMap))))]
-                               [msPerTick (exact->inexact (/ lastTempo ticksPerQuarterNote))]
-                               [ticksRemaining (- targetTick currentTick)])
-                          (+ timeInSeconds (* ticksRemaining msPerTick 1e-6)))
-                        ;; Process tempo segments
-                        (let* ([currentTempoEntry (list-ref tempoMap tempoIdx)]
-                               [currentTempoValue (cdr currentTempoEntry)])
-                          ;; Determine the end of this tempo segment
-                          (let ([segmentEndTick (if (< tempoIdx (1- (length tempoMap)))
-                                                    (car (list-ref tempoMap (1+ tempoIdx)))
-                                                    targetTick)])
-                            (if (<= targetTick segmentEndTick)
-                                ;; Target is within this tempo segment
-                                (let* ([ticksInSegment (- targetTick currentTick)]
-                                       [msPerTick (exact->inexact (/ currentTempoValue ticksPerQuarterNote))]
-                                       [segmentTime (* ticksInSegment msPerTick 1e-6)])
-                                  (+ timeInSeconds segmentTime))
-                                ;; Target is beyond this segment, process and continue
-                                (let* ([ticksInSegment (- segmentEndTick currentTick)]
-                                       [msPerTick (exact->inexact (/ currentTempoValue ticksPerQuarterNote))]
-                                       [segmentTime (* ticksInSegment msPerTick 1e-6)])
-                                  (loop segmentEndTick
-                                        (+ timeInSeconds segmentTime)
-                                        (1+ tempoIdx))))))))))))
+                    (let* ([currentTempoEntry (list-ref tempoMap tempoIdx)]
+                           [currentTempoValue (cdr currentTempoEntry)])
+                      ;; Determine the end of this tempo segment
+                      (let ([segmentEndTick (if (< tempoIdx (1- (length tempoMap)))
+                                                (car (list-ref tempoMap (1+ tempoIdx)))
+                                                targetTick)])
+                        (if (<= targetTick segmentEndTick)
+                            ;; Target is within this tempo segment
+                            (let* ([ticksInSegment (- targetTick currentTick)]
+                                   [msPerTick (exact->inexact (/ currentTempoValue ticksPerQuarterNote))]
+                                   [segmentTime (* ticksInSegment msPerTick 1e-6)])
+                              (+ timeInSeconds segmentTime))
+                            ;; Target is beyond this segment, process and continue
+                            (let* ([ticksInSegment (- segmentEndTick currentTick)]
+                                   [msPerTick (exact->inexact (/ currentTempoValue ticksPerQuarterNote))]
+                                   [segmentTime (* ticksInSegment msPerTick 1e-6)])
+                              (loop segmentEndTick
+                                    (+ timeInSeconds segmentTime)
+                                    (1+ tempoIdx)))))))))))
     
     (for-each
      (lambda (note)
