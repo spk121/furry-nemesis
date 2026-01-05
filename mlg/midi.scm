@@ -23,6 +23,11 @@
 (define S_SONG_SELECT #xF3)
 (define S_TUNE_REQUEST #xF6)
 (define S_EOX #xF7)
+(define S_TIMING_CLOCK #xF8)
+(define S_START #xFA)
+(define S_CONTINUE #xFB)
+(define S_STOP #xFC)
+(define S_ACTIVE_SENSING #xFE)
 (define S_SYSTEM_RESET #xFF)
 
 (define (get-midi-var-int port)
@@ -77,6 +82,10 @@ expected.  Variable length integers never have more than 4 bytes."
   (let ([byte1 (get-u8 port)]
 	[byte2 (get-u8 port)])
     (cond 
+     [(and (eqv? byte1 #x00) (eqv? byte2 #x02))
+      (list 'SEQUENCE_NUMBER
+	    #:channel channel
+	    #:value (get-u16-be port))]
      [(and (eqv? byte1 #x01))
       (list 'TEXT_EVENT
 	    #:channel channel
@@ -105,6 +114,18 @@ expected.  Variable length integers never have more than 4 bytes."
       (list 'CUE_POINT
 	    #:channel channel
 	    #:text (get-latin1-string port byte2))]
+     [(and (eqv? byte1 #x08))
+      (list 'PROGRAM_NAME
+	    #:channel channel
+	    #:text (get-latin1-string port byte2))]
+     [(and (eqv? byte1 #x09))
+      (list 'DEVICE_NAME
+	    #:channel channel
+	    #:text (get-latin1-string port byte2))]
+     [(and (eqv? byte1 #x20) (eqv? byte2 #x01))
+      (list 'MIDI_CHANNEL_PREFIX
+            #:channel channel
+            #:prefix (get-u8 port))]
      [(and (eqv? byte1 #x21) (eqv? byte2 #x01))
       (list 'MIDI_PORT
             #:channel channel
@@ -112,10 +133,6 @@ expected.  Variable length integers never have more than 4 bytes."
      [(and (eqv? byte1 #x2F) (eqv? byte2 #x00))
       (list 'END_OF_TRACK
 	    #:channel channel)]
-     [(and (eqv? byte1 #x00) (eqv? byte2 #x02))
-      (list 'SEQUENCE_NUMBER
-	    #:channel channel
-	    #:value (get-u16-be port))]
      [(and (eqv? byte1 #x51) (eqv? byte2 #x03))
       (list 'SET_TEMPO
 	    #:channel channel
@@ -151,6 +168,15 @@ expected.  Variable length integers never have more than 4 bytes."
 	      (if (eqv? 0 byte2)
 		  'MAJOR
 		  'MINOR)))]
+     [(and (eqv? byte1 #x7F))
+      ;; Sequencer-specific meta event
+      (let ([data (let loop ([i 0] [acc '()])
+                    (if (= i byte2)
+                        (reverse acc)
+                        (loop (1+ i) (cons (get-u8 port) acc))))])
+        (list 'SEQUENCER_SPECIFIC
+              #:channel channel
+              #:data data))]
      [else
       (do ([i 0 (1+ i)]) ([= i byte2])
           (get-u8 port))
@@ -224,6 +250,24 @@ expected.  Variable length integers never have more than 4 bytes."
        (list 'SONG_SELECT
 	     #:channel (_LoVal status)
 	     #:song (get-u8 port))]
+      
+      [(eqv? status S_TUNE_REQUEST)
+       (list 'TUNE_REQUEST)]
+      
+      [(eqv? status S_TIMING_CLOCK)
+       (list 'TIMING_CLOCK)]
+      
+      [(eqv? status S_START)
+       (list 'START)]
+      
+      [(eqv? status S_CONTINUE)
+       (list 'CONTINUE)]
+      
+      [(eqv? status S_STOP)
+       (list 'STOP)]
+      
+      [(eqv? status S_ACTIVE_SENSING)
+       (list 'ACTIVE_SENSING)]
       
       ((eqv? status S_SYSTEM_RESET)
        (if (not (logtest (lookahead-u8 port) #x80))

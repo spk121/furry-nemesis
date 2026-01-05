@@ -26,7 +26,7 @@
       ;; (pretty-print noteList)
       (display "Compute real times")
       (newline)
-      (NormalizeNoteListTimes! noteList ticksPerQuarter (list (car tempoMap)))
+      (NormalizeNoteListTimes! noteList ticksPerQuarter tempoMap)
       ;; (pretty-print noteList)
       (display "Begin rendering to WAV...")
       (let ([wav (NoteList->PCM noteList)])

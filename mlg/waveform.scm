@@ -125,25 +125,28 @@
              (set! t (+ t (/ 1.0 SAMPLE_RATE))))
       buf)))
 
-(define (GenerateTone time instrument note duration velocity)
+(define (GenerateTone time instrument note duration velocity pitch-bend)
   (let ([instrumentData (find
                          (lambda (entry)
                            (eqv? (car entry) instrument))
                          tuned)])
-    (let ([d_attack (list-ref instrumentData 1)]
-          [d_decay (list-ref instrumentData 2)]
-          [tmp_decay (list-ref instrumentData 2)]
-          [d_sustain 0]
-          [d_release (list-ref instrumentData 3)]
-          [freq (* 440 (expt 2.0 (/ (- note 69) 12.0)))]
-          [a1 (/ (* velocity (list-ref instrumentData 4)) 127)]
-          [a2 (/ (* velocity (list-ref instrumentData 5)) 127)]
-          [f1 (list-ref instrumentData 6)]
-          [f2 (list-ref instrumentData 7)]
-          [f3 1.0]
-          [f4 (list-ref instrumentData 8)]
-          [wav (list-ref instrumentData 9)]
-          [duty (list-ref instrumentData 10)])
+    (let* ([d_attack (list-ref instrumentData 1)]
+           [d_decay (list-ref instrumentData 2)]
+           [tmp_decay (list-ref instrumentData 2)]
+           [d_sustain 0]
+           [d_release (list-ref instrumentData 3)]
+           ;; Convert pitch bend from 0-16383 (center 8192) to semitone offset
+           ;; Standard MIDI pitch bend range is ±2 semitones
+           [bend-semitones (* 2.0 (/ (- pitch-bend 8192) 8192.0))]
+           [freq (* 440 (expt 2.0 (/ (+ (- note 69) bend-semitones) 12.0)))]
+           [a1 (/ (* velocity (list-ref instrumentData 4)) 127)]
+           [a2 (/ (* velocity (list-ref instrumentData 5)) 127)]
+           [f1 (list-ref instrumentData 6)]
+           [f2 (list-ref instrumentData 7)]
+           [f3 1.0]
+           [f4 (list-ref instrumentData 8)]
+           [wav (list-ref instrumentData 9)]
+           [duty (list-ref instrumentData 10)])
       (if (<= duration d_attack)
           (set! tmp_decay 0)
           (if (<= duration (+ d_attack d_decay))
@@ -183,7 +186,8 @@
           [patch (note-patch note)]
           [percussion (note-percussion note)]
           [velocity-begin (note-velocity-begin note)]
-          [velocity-end (note-velocity-end note)])
+          [velocity-end (note-velocity-end note)]
+          [pitch-bend (note-pitch-bend note)])
       (set! start (* 2 (inexact->exact (floor (* time SAMPLE_RATE)))))
       (if (not percussion)
           (begin 
@@ -199,7 +203,7 @@
              [(< patch 72) (set! instrument 'LEAD)]
              [(< patch 80) (set! instrument 'PAD)]
              [else (set! instrument 'OTHER)])
-            (set! pcm (GenerateTone time instrument key duration velocity-begin)))
+            (set! pcm (GenerateTone time instrument key duration velocity-begin pitch-bend)))
           ;; else
           (begin
             (cond
