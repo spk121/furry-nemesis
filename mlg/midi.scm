@@ -170,9 +170,10 @@ expected.  Variable length integers never have more than 4 bytes."
 		  'MINOR)))]
      [(and (eqv? byte1 #x7F))
       ;; Sequencer-specific meta event
-      (let ([data '()])
-        (do ([i 0 (1+ i)]) ([= i byte2])
-            (set! data (append data (list (get-u8 port)))))
+      (let ([data (let loop ([i 0] [acc '()])
+                    (if (= i byte2)
+                        (reverse acc)
+                        (loop (1+ i) (cons (get-u8 port) acc))))])
         (list 'SEQUENCER_SPECIFIC
               #:channel channel
               #:data data))]
