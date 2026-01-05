@@ -1,0 +1,5 @@
+*.wav
+*.midi
+tmp.*
+test-*.scm
+.cache/

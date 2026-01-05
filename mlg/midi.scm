@@ -23,6 +23,11 @@
 (define S_SONG_SELECT #xF3)
 (define S_TUNE_REQUEST #xF6)
 (define S_EOX #xF7)
+(define S_TIMING_CLOCK #xF8)
+(define S_START #xFA)
+(define S_CONTINUE #xFB)
+(define S_STOP #xFC)
+(define S_ACTIVE_SENSING #xFE)
 (define S_SYSTEM_RESET #xFF)
 
 (define (get-midi-var-int port)
@@ -244,6 +249,24 @@ expected.  Variable length integers never have more than 4 bytes."
        (list 'SONG_SELECT
 	     #:channel (_LoVal status)
 	     #:song (get-u8 port))]
+      
+      [(eqv? status S_TUNE_REQUEST)
+       (list 'TUNE_REQUEST)]
+      
+      [(eqv? status S_TIMING_CLOCK)
+       (list 'TIMING_CLOCK)]
+      
+      [(eqv? status S_START)
+       (list 'START)]
+      
+      [(eqv? status S_CONTINUE)
+       (list 'CONTINUE)]
+      
+      [(eqv? status S_STOP)
+       (list 'STOP)]
+      
+      [(eqv? status S_ACTIVE_SENSING)
+       (list 'ACTIVE_SENSING)]
       
       ((eqv? status S_SYSTEM_RESET)
        (if (not (logtest (lookahead-u8 port) #x80))
