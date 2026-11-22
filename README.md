@@ -1,8 +1,9 @@
 furry-nemesis
 =============
 
-Hi.  This program renders a file named "tmp.midi", which you must provide,
-into a file named "tmp.wav".
+Hi.  This program renders a MIDI file into a stereo WAV file. Run
+`./main.scm song.mid` to write `song.wav`; `potluck2014.scm` renders
+"tmp.midi" into "tmp.wav".
 
 It is really slow.  Sorry about that.  I'm using a primitive method to
 generate the wav files, keeping too much data in memory.  I'll make it
@@ -22,6 +23,7 @@ more efficient when I get some spare time.
 | `-i`, `--input=FILE` | MIDI file to read (default `tmp.midi`; may also be a positional argument) |
 | `-o`, `--output=FILE` | WAV file to write (default: input name with `.wav`) |
 | `-r`, `--sample-rate=HZ` | output sample rate (default 44100) |
+| `-m`, `--mono` | write a mono WAV that ignores pan (the default is stereo) |
 | `-b`, `--bend-range=SEMI` | pitch wheel range in semitones (default 2) |
 | `-t`, `--tempo=BPM` | tempo used when the file has no tempo events (default 120) |
 | `--no-drums` / `--drums-only` | skip, or render only, channel 10 percussion |
@@ -44,6 +46,7 @@ Playback goes through a 16-channel MIDI receiver model. It applies:
 - the pitch wheel continuously, including mid-note bends
 - RPN pitch bend sensitivity and fine/coarse tuning
 - volume, expression and master volume
+- pan and balance, in stereo output
 - sustain, sostenuto and soft pedals
 - modulation wheel and aftertouch (as vibrato)
 - portamento
@@ -51,7 +54,7 @@ Playback goes through a 16-channel MIDI receiver model. It applies:
 - Reset All Controllers, Mono/Poly mode, and General MIDI reset
 
 See [MIDI_1.1_COMPLIANCE.md](MIDI_1.1_COMPLIANCE.md) for the details and
-for what a mono chiptune renderer can't reproduce, such as pan.
+for what a chiptune renderer can't reproduce, such as reverb.
 
 Run the tests with:
 

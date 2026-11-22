@@ -24,6 +24,8 @@
 ;;;  12 mod-curve       ((t . depth) ...) 0..1 vibrato depth
 ;;;  13 glide           (semitones . seconds) portamento, or #f
 ;;;  14 stop            time at which sound is cut (All Sound Off), or #f
+;;;  15 pan-curve       ((t . (left . right)) ...) stereo gains from pan
+;;;                     (CC 10) and balance (CC 8)
 ;;;
 ;;; Curve and stop times are absolute ticks from MidiEvents->NoteList
 ;;; and seconds relative to the note's start after
@@ -49,6 +51,8 @@
             note-mod-curve
             note-glide
             note-stop
+            note-pan-curve
+            pan-gains
 
             MidiEvents->NoteList
             NormalizeNoteListTimes!
@@ -88,6 +92,7 @@
 (define (note-mod-curve n) (field n 12 '()))
 (define (note-glide n) (field n 13 #f))
 (define (note-stop n) (field n 14 #f))
+(define (note-pan-curve n) (field n 15 (list (cons 0 (pan-gains 64 64)))))
 
 ;;; ------------------------------------------------------------------
 ;;; Synthesis constants
@@ -127,6 +132,7 @@
   (let ([cc (make-vector 128 0)]
         [rpn (make-hash-table)])
     (vector-set! cc 7 100)              ; volume
+    (vector-set! cc 8 64)               ; balance
     (vector-set! cc 10 64)              ; pan
     (vector-set! cc 11 127)             ; expression
     (vector-set! cc 100 127)            ; RPN null
@@ -166,6 +172,20 @@ usual 40*log10 response curve, plus the soft pedal and master volume."
     (* vol vol expr expr master
        (if (pedal? ch 67) SOFT_PEDAL_GAIN 1.0))))
 
+(define (pan-gains pan balance)
+  "Left and right gains for 7-bit (or fractional 14-bit) PAN and
+BALANCE controller values, 64 being centre.  Pan uses a constant-power
+law, so a centred voice is about 3 dB down in each speaker; balance
+only ever attenuates the opposite side."
+  (define (position v) (max -1.0 (min 1.0 (/ (- v 64) 63.0))))
+  (let* ([theta (* (+ (position pan) 1.0) (/ 3.141592653589793 4))]
+         [b (position balance)])
+    (cons (* (cos theta) (min 1.0 (- 1.0 b)))
+          (* (sin theta) (min 1.0 (+ 1.0 b))))))
+
+(define (channel-pan ch)
+  (pan-gains (cc14 ch 10) (cc14 ch 8)))
+
 (define (channel-mod ch key)
   "Vibrato depth 0..1 from the modulation wheel and aftertouch."
   (/ (max (min 127 (cc14 ch 1))
@@ -181,7 +201,7 @@ usual 40*log10 response curve, plus the soft pedal and master volume."
 
 (define-record-type <tg>
   (%make-tg start key channel track patch perc velocity bend-raw
-            pitch gain mod glide state latched end end-vel tail-end stop)
+            pitch gain mod pan glide state latched end end-vel tail-end stop)
   tg?
   (start tg-start)
   (key tg-key)
@@ -194,6 +214,7 @@ usual 40*log10 response curve, plus the soft pedal and master volume."
   (pitch tg-pitch set-tg-pitch!)        ; reversed curves
   (gain tg-gain set-tg-gain!)
   (mod tg-mod set-tg-mod!)
+  (pan tg-pan set-tg-pan!)
   (glide tg-glide)
   (state tg-state set-tg-state!)        ; on or sustained
   (latched tg-latched set-tg-latched!)  ; held by sostenuto
@@ -206,10 +227,10 @@ usual 40*log10 response curve, plus the soft pedal and master volume."
   "Add a point to a reversed step curve, skipping repeated values and
 replacing a point at the same tick."
   (cond
-   [(and (pair? curve) (= (cdar curve) val)) curve]
+   [(and (pair? curve) (equal? (cdar curve) val)) curve]
    [(and (pair? curve) (= (caar curve) tick))
     (let ([rest (cdr curve)])
-      (if (and (pair? rest) (= (cdar rest) val))
+      (if (and (pair? rest) (equal? (cdar rest) val))
           rest
           (cons (cons tick val) rest)))]
    [else (cons (cons tick val) curve)]))
@@ -229,7 +250,8 @@ replacing a point at the same tick."
         (reverse (tg-gain tg))
         (reverse (tg-mod tg))
         (tg-glide tg)
-        (tg-stop tg)))
+        (tg-stop tg)
+        (reverse (tg-pan tg))))
 
 ;;; ------------------------------------------------------------------
 ;;; The receiver
@@ -263,17 +285,19 @@ by start time."
     (filter (lambda (tg) (= (tg-channel tg) c)) active))
 
   (define (refresh! c)
-    ;; Record the channel's current pitch, gain and vibrato on every
-    ;; note it is sounding.
+    ;; Record the channel's current pitch, gain, vibrato and pan on
+    ;; every note it is sounding.
     (let* ([ch (chan c)]
            [pitch (channel-pitch ch)]
-           [gain (channel-gain ch master)])
+           [gain (channel-gain ch master)]
+           [pan (channel-pan ch)])
       (for-each (lambda (tg)
                   (unless (tg-perc tg)
                     (set-tg-pitch! tg (curve-push (tg-pitch tg) now pitch))
                     (set-tg-mod! tg (curve-push (tg-mod tg) now
                                                 (channel-mod ch (tg-key tg)))))
-                  (set-tg-gain! tg (curve-push (tg-gain tg) now gain)))
+                  (set-tg-gain! tg (curve-push (tg-gain tg) now gain))
+                  (set-tg-pan! tg (curve-push (tg-pan tg) now pan)))
                 (live-on c))))
 
   (define (refresh-all!)
@@ -384,6 +408,7 @@ by start time."
       (case n
         [(1 33) (refresh! c)]            ; modulation wheel
         [(7 39 11 43) (refresh! c)]     ; volume, expression
+        [(8 40 10 42) (refresh! c)]     ; balance, pan
         [(6) (data-entry! c 'msb value)]
         [(38) (data-entry! c 'lsb value)]
         [(96) (data-entry! c 'inc value)]
@@ -428,6 +453,7 @@ by start time."
                            (if perc '() (list (cons now (channel-pitch ch))))
                            (list (cons now (channel-gain ch master)))
                            (if perc '() (list (cons now (channel-mod ch key))))
+                           (list (cons now (channel-pan ch)))
                            glide (quote on) #f
                            #f 0 #f #f)])
         (set-ch-porta-key! ch #f)
@@ -564,12 +590,12 @@ points and stop times become seconds relative to the note's start."
          (define (relative tick) (max 0.0 (- (->sec tick) start)))
          (list-set! note 0 start)
          (list-set! note 1 (- end start))
-         (when (> (length note) 14)
+         (when (> (length note) 15)
            (for-each (lambda (i)
                        (list-set! note i
                                   (map (lambda (pt) (cons (relative (car pt)) (cdr pt)))
                                        (list-ref note i))))
-                     '(10 11 12))
+                     '(10 11 12 15))
            (when (note-stop note)
              (list-set! note 14 (relative (note-stop note)))))))
      noteList)))

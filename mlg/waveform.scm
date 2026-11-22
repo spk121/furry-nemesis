@@ -4,11 +4,16 @@
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:export (NoteList->PCM
-            sample-rate))
+            sample-rate
+            output-channels))
 
 ;; Output sample rate in Hz.  A parameter so callers can override it
 ;; with `parameterize'.
 (define sample-rate (make-parameter 44100))
+
+;; 2 for interleaved stereo (left, right) following each note's pan
+;; curve, or 1 for mono, which ignores pan and balance.
+(define output-channels (make-parameter 2))
 
 (define MAX #x7FF)
 
@@ -245,27 +250,48 @@ release) the release phase.  0 means no release velocity was sent."
       (GeneratePCM d_attack d_decay d_sustain d_release f1 f2 f3 f4 a1 a2 duty 1 wav
                    #:gain-curve (note-gain-curve note)))))
 
+;; Saturate rather than overflow when many voices pile up.
+(define (mix! wav offset sample)
+  (bytevector-s16-set! wav offset
+                       (max -32768
+                            (min 32767
+                                 (+ (bytevector-s16-ref wav offset (endianness little))
+                                    sample)))
+                       (endianness little)))
+
 (define (AddNoteWaveform! wav note)
+  "Mix NOTE into WAV, a little-endian 16-bit buffer holding
+(output-channels) interleaved channels."
   (let* ([sr (sample-rate)]
-         [start (* 2 (inexact->exact (floor (* (note-time note) sr))))]
+         [nch (output-channels)]
+         [frame-bytes (* 2 nch)]
+         [start-frame (inexact->exact (floor (* (note-time note) sr)))]
          [pcm (if (note-percussion note)
                   (GenerateNoise note)
                   (GenerateTone note))]
+         [pcm-frames (quotient (bytevector-length pcm) 2)]
          ;; All Sound Off cuts the note dead at its stop time.
          [limit (let ([stop (note-stop note)])
                   (if stop
-                      (min (bytevector-length pcm)
-                           (* 2 (inexact->exact (floor (* stop sr)))))
-                      (bytevector-length pcm)))]
-         [end (min limit (- (bytevector-length wav) start))])
-    (do ((i 0 (+ i 2)))
-        ((>= i end))
-      (let ([sum (+ (bytevector-s16-ref wav (+ i start) (endianness little))
-                    (bytevector-s16-ref pcm i (native-endianness)))])
-        ;; Saturate rather than overflow when many voices pile up.
-        (bytevector-s16-set! wav (+ i start)
-                             (max -32768 (min 32767 sum))
-                             (endianness little))))))
+                      (min pcm-frames (inexact->exact (floor (* stop sr))))
+                      pcm-frames))]
+         [frames (min limit (- (quotient (bytevector-length wav) frame-bytes)
+                               start-frame))])
+    (if (= nch 1)
+        (do ([k 0 (1+ k)])
+            ((>= k frames))
+          (mix! wav (* 2 (+ start-frame k))
+                (bytevector-s16-ref pcm (* 2 k) (native-endianness))))
+        ;; Stereo: the pan curve is a step function, so only
+        ;; recompute the gains when it moves.
+        (let ([pan-at (make-step-reader (note-pan-curve note) (pan-gains 64 64))])
+          (do ([k 0 (1+ k)])
+              ((>= k frames))
+            (let* ([gains (pan-at (/ k (exact->inexact sr)))]
+                   [s (bytevector-s16-ref pcm (* 2 k) (native-endianness))]
+                   [offset (* frame-bytes (+ start-frame k))])
+              (mix! wav offset (inexact->exact (round (* s (car gains)))))
+              (mix! wav (+ offset 2) (inexact->exact (round (* s (cdr gains)))))))))))
 
 (define (FindDuration noteList)
   "Length of the song in seconds, allowing for release tails."
@@ -274,16 +300,24 @@ release) the release phase.  0 means no release velocity was sent."
         0 noteList))
 
 (define (NoteList->PCM noteList)
-  "Given a list of notes, generate PCM waveform using an 8-bit-style
-soft synth."
+  "Given a list of notes, generate a little-endian 16-bit PCM buffer
+using an 8-bit-style soft synth.  The buffer has (output-channels)
+interleaved channels at (sample-rate)."
   (let* ([duration (FindDuration noteList)]
-         [samples (inexact->exact (ceiling (* duration (sample-rate))))]
-         [wav (make-bytevector (* 2 samples) 0)])
+         [frames (inexact->exact (ceiling (* duration (sample-rate))))]
+         [frame-bytes (* 2 (output-channels))]
+         [wav (make-bytevector (* frame-bytes frames) 0)])
     (for-each (lambda (note) (AddNoteWaveform! wav note)) noteList)
-    ;; Drop the silence left over from padding for release tails.
+    ;; Drop the silence left over from padding for release tails,
+    ;; trimming whole frames.
+    (define (silent-frame? end)
+      (let loop ([i (- end frame-bytes)])
+        (or (>= i end)
+            (and (zero? (bytevector-s16-ref wav i (endianness little)))
+                 (loop (+ i 2))))))
     (let loop ([n (bytevector-length wav)])
-      (if (and (> n 0) (zero? (bytevector-s16-ref wav (- n 2) (endianness little))))
-          (loop (- n 2))
+      (if (and (> n 0) (silent-frame? n))
+          (loop (- n frame-bytes))
           (if (= n (bytevector-length wav))
               wav
               (let ([out (make-bytevector n)])

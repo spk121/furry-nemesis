@@ -35,6 +35,7 @@
     (input         (single-char #\i) (value #t))
     (output        (single-char #\o) (value #t))
     (sample-rate   (single-char #\r) (value #t) (predicate ,positive-number?))
+    (mono          (single-char #\m) (value #f))
     (bend-range    (single-char #\b) (value #t) (predicate ,positive-number?))
     (tempo         (single-char #\t) (value #t) (predicate ,positive-number?))
     (no-drums      (value #f))
@@ -49,7 +50,7 @@
 
 (define (show-help)
   (format #t "Usage: ~a [OPTION]... [INPUT]
-Render a Standard MIDI File to a 16-bit mono WAV file using an
+Render a Standard MIDI File to a 16-bit stereo WAV file using an
 8-bit-style chiptune soft synth.
 
 Input/output:
@@ -60,6 +61,8 @@ Input/output:
 
 Synthesis:
   -r, --sample-rate=HZ    output sample rate in Hz (default: ~a)
+  -m, --mono              write a mono file, ignoring pan and balance
+                          (the default is stereo)
   -b, --bend-range=SEMI   initial pitch bend sensitivity in semitones; files
                           can change it per channel with RPN 0 (default: ~a)
   -t, --tempo=BPM         tempo used when the file has no SET_TEMPO
@@ -106,9 +109,10 @@ Diagnostics:
 ;;; ------------------------------------------------------------------
 ;;; WAV output
 
-(define (write-wav filename pcm rate)
-  "Write the 16-bit mono PCM bytevector PCM to FILENAME as a RIFF WAV
-file at sample rate RATE."
+(define (write-wav filename pcm rate channels)
+  "Write PCM, a bytevector of interleaved little-endian 16-bit samples
+with CHANNELS channels, to FILENAME as a RIFF WAV file at sample rate
+RATE."
   (let ([port (open-file-output-port filename (file-options no-fail))]
         [header (make-bytevector 44 0)]
         [data-len (bytevector-length pcm)])
@@ -124,10 +128,10 @@ file at sample rate RATE."
     (put-str! 12 "fmt ")
     (put-u32! 16 16)                    ; fmt chunk size
     (put-u16! 20 1)                     ; PCM
-    (put-u16! 22 1)                     ; mono
+    (put-u16! 22 channels)              ; channel count
     (put-u32! 24 rate)                  ; sample rate
-    (put-u32! 28 (* rate 2))            ; byte rate
-    (put-u16! 32 2)                     ; block align
+    (put-u32! 28 (* rate 2 channels))   ; byte rate
+    (put-u16! 32 (* 2 channels))        ; block align
     (put-u16! 34 16)                    ; bits per sample
     (put-str! 36 "data")
     (put-u32! 40 data-len)
@@ -158,6 +162,7 @@ file at sample rate RATE."
                       default-input)]
            [output (or (option-ref options 'output #f)
                        (replace-extension input ".wav"))]
+           [channels (if (option-ref options 'mono #f) 1 2)]
            [rate (inexact->exact
                   (round (option-number options 'sample-rate (sample-rate))))]
            [bend (option-number options 'bend-range (pitch-bend-range))]
@@ -187,6 +192,7 @@ file at sample rate RATE."
         (die "output file would overwrite input file '~a'" input))
 
       (parameterize ([sample-rate rate]
+                     [output-channels channels]
                      [pitch-bend-range bend]
                      [default-tempo (inexact->exact (round (/ 60e6 bpm)))]
                      [midi-trace (option-ref options 'trace #f)])
@@ -247,9 +253,10 @@ file at sample rate RATE."
                [(null? noteList)
                 (die "no notes to render")]
                [else
-                (say "Rendering to ~a at ~a Hz...~%" output rate)
+                (say "Rendering to ~a at ~a Hz ~a...~%" output rate
+                     (if (= channels 2) "stereo" "mono"))
                 (let ([pcm (NoteList->PCM noteList)])
-                  (write-wav output pcm rate)
+                  (write-wav output pcm rate channels)
                   (detail "  wrote ~a bytes~%"
                           (+ 44 (bytevector-length pcm))))
                 (say "Done~%")]))))))))

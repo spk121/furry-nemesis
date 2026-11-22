@@ -29,7 +29,8 @@
       (NormalizeNoteListTimes! noteList ticksPerQuarter tempoMap)
       ;; (pretty-print noteList)
       (display "Begin rendering to WAV...")
-      (let ([wav (NoteList->PCM noteList)])
+      ;; This script writes a mono WAV header, so render in mono.
+      (let ([wav (parameterize ([output-channels 1]) (NoteList->PCM noteList))])
         (let ([port (open-file "tmp.wav" "wb")])
           (put-u8 port #x52)            ; R
           (put-u8 port #x49)            ; I

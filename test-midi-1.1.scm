@@ -349,6 +349,28 @@
     (check "program reset" (= 0 (note-patch n)))
     (check "volume reset" (approx= (expt (/ 100 127.0) 2) (cdar (note-gain-curve n))))))
 
+(section "Pan and balance"
+  (let* ([notes (notes-of
+                 (parse (smf (list (track tempo-120
+                                          (on 0 60 100)
+                                          (at 24 (cc 0 10 0))     ; hard left
+                                          (at 24 (cc 0 10 127))   ; hard right
+                                          (at 24 (cc 0 121 0))    ; reset: pan kept
+                                          (at 24 (off 0 60))
+                                          (cc 0 10 64) (cc 0 8 0) ; balance left
+                                          (on 0 62 100) (at 96 (off 0 62)))))))]
+         [p (curve-values (note-pan-curve (first notes)))]
+         [b (cdar (note-pan-curve (second notes)))])
+    (check "centre is constant power"
+           (and (approx= (sqrt 0.5) (car (first p))) (approx= (sqrt 0.5) (cdr (first p)))))
+    (check "hard left" (and (approx= 1.0 (car (second p))) (approx= 0.0 (cdr (second p)))))
+    (check "hard right" (and (approx= 0.0 (car (third p))) (approx= 1.0 (cdr (third p)))))
+    (check "Reset All Controllers keeps pan"
+           (not (any (lambda (pt) (approx= 0.375 (car pt)))
+                     (note-pan-curve (first notes)))))
+    (check "balance left silences the right side"
+           (and (approx= (sqrt 0.5) (car b)) (approx= 0.0 (cdr b))))))
+
 ;;; ------------------------------------------------------------------
 ;;; Synthesizer
 
@@ -371,6 +393,34 @@
                (if (>= i (bytevector-length pcm))
                    (<= peak 32767)
                    (loop (+ i 2) (max peak (abs (bytevector-s16-ref pcm i (endianness little)))))))))))
+
+(section "Stereo rendering"
+  (parameterize ([sample-rate 8000])
+    (let* ([notes (notes-of
+                   (parse (smf (list (track tempo-120
+                                            (cc 0 10 0) (cc 1 10 127)
+                                            (on 0 60 100) (at 48 (off 0 60))
+                                            (on 1 64 100) (at 48 (off 1 64)))))))]
+           [stereo (parameterize ([output-channels 2]) (NoteList->PCM notes))]
+           [mono (parameterize ([output-channels 1]) (NoteList->PCM notes))])
+      (define (energy bv start stride)
+        (let loop ([i start] [e 0])
+          (if (>= i (bytevector-length bv))
+              e
+              (loop (+ i stride)
+                    (+ e (abs (bytevector-s16-ref bv i (endianness little))))))))
+      (check "stereo buffer holds two channels per frame"
+             (zero? (remainder (bytevector-length stereo) 4)))
+      (check "stereo is twice the size of mono"
+             (= (bytevector-length stereo) (* 2 (bytevector-length mono))))
+      (check "left-panned note is silent on the right"
+             ;; The first 0.25 s (2000 frames) hold only the left note.
+             (zero? (energy (let ([b (make-bytevector (* 4 2000) 0)])
+                              (bytevector-copy! stereo 0 b 0 (* 4 2000))
+                              b)
+                            2 4)))
+      (check "right-panned note reaches the right channel"
+             (positive? (energy stereo 2 4))))))
 
 (format #t "~%~a/~a checks passed~%" (- checks failures) checks)
 (exit (if (zero? failures) 0 1))

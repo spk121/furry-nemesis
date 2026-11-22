@@ -12,7 +12,7 @@ The code is split into three layers:
 | --- | --- |
 | `mlg/midi.scm` | Standard MIDI File parser: bytes to a time-sorted event list |
 | `mlg/notelist.scm` | A 16-channel MIDI receiver model: events to notes with controller curves |
-| `mlg/waveform.scm` | Chiptune synthesizer: notes to 16-bit PCM |
+| `mlg/waveform.scm` | Chiptune synthesizer: notes to 16-bit stereo (or mono) PCM |
 
 ## File format (parser)
 
@@ -88,6 +88,8 @@ The table shows how each message affects the sound.
 | 5 / 37 | Portamento Time | glide time, up to 3 s |
 | 6 / 38 | Data Entry MSB / LSB | sets the selected RPN |
 | 7 / 39 | Channel Volume | gain, using the standard 40·log10 curve |
+| 8 / 40 | Balance | attenuates the opposite speaker; centre (64) leaves both at full level |
+| 10 / 42 | Pan | constant-power stereo placement; centre is −3 dB in each speaker |
 | 11 / 43 | Expression | gain, using the standard 40·log10 curve |
 | 64 | Sustain (damper) | holds released notes until the pedal is lifted |
 | 65 | Portamento On/Off | glides from the channel's previous key |
@@ -114,7 +116,7 @@ clears its LSB, as the spec requires. Other controllers are stored.
 | CC | Message | Behaviour |
 | --- | --- | --- |
 | 120 | All Sound Off | silences the channel immediately, cutting release tails and ignoring pedals |
-| 121 | Reset All Controllers | resets the pitch wheel, modulation, expression, pedals, portamento, aftertouch and RPN/NRPN selection. Volume, pan, program, bank and RPN values are left alone, per RP-015. |
+| 121 | Reset All Controllers | resets the pitch wheel, modulation, expression, pedals, portamento, aftertouch and RPN/NRPN selection. Volume, pan, balance, program, bank and RPN values are left alone, per RP-015. |
 | 122 | Local Control | recognised; it has no meaning for file playback |
 | 123 | All Notes Off | releases every key, but notes held by a pedal keep sounding |
 | 124 / 125 | Omni Off / On | turns all notes off; every channel is always rendered |
@@ -141,16 +143,19 @@ looked up in the tempo map by binary search.
 
 Each note is rendered with an attack, decay, sustain and release
 envelope and a square or sine-ish wave, in the original chiptune style.
-Pitch, gain and vibrato follow the curves the receiver recorded, and
+Pitch, gain, vibrato and stereo position follow the curves the
+receiver recorded, so a pan sweep moves a note while it sounds. Output is
+interleaved stereo by default; `--mono` renders one channel and ignores pan
+and balance. Pitch, gain and vibrato changes are applied the same way, and
 portamento glides linearly in pitch. Percussion on channel 10 uses the
 General MIDI key map (keys 35–81 mapped to noise instruments). It
-follows volume and expression but not pitch bend, as on GM drum kits.
+follows volume, expression and pan but not pitch bend, as on GM drum kits.
 The mix saturates at the 16-bit limit instead of overflowing.
 
 Some things are recorded but can't be heard in this renderer:
 
-- **Pan, balance and Effects 1–5 depths**: output is mono and has no
-  effects processor.
+- **Effects 1–5 depths (reverb, chorus and so on)**: there is no effects
+  processor.
 - **Bank select**: there is a single bank.
 - **Omni mode and Local Control**: these are about how a live
   instrument listens to its MIDI input, which doesn't apply when
