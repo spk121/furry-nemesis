@@ -1,6 +1,6 @@
 #!/usr/bin/env -S guile -e main -s
 !#
-;;; midichip.scm -- command-line front end for the furry-nemesis MIDI
+;;; midichip.scm -- command-line front end for the midichip MIDI
 ;;; chiptune renderer.
 ;;;
 ;;; Usage: ./midichip.scm [OPTION]... [INPUT.mid]

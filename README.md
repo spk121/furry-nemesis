@@ -1,5 +1,5 @@
-furry-nemesis
-=============
+midichip
+========
 
 Hi.  This program renders a MIDI file into a stereo WAV file. Run
 `./midichip.scm song.mid` to write `song.wav`.

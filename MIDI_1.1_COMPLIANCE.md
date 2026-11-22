@@ -1,6 +1,6 @@
 # MIDI 1.0 / Standard MIDI File 1.1 Compliance
 
-This document describes how furry-nemesis implements the MIDI 1.0
+This document describes how midichip implements the MIDI 1.0
 Detailed Specification and the Standard MIDI Files 1.0 specification
 (as revised for "MIDI 1.1"), and where a chiptune renderer necessarily
 departs from a full synthesizer. `test-midi-1.1.scm` checks the
