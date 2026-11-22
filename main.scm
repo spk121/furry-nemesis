@@ -60,7 +60,8 @@ Input/output:
 
 Synthesis:
   -r, --sample-rate=HZ    output sample rate in Hz (default: ~a)
-  -b, --bend-range=SEMI   pitch wheel range in semitones (default: ~a)
+  -b, --bend-range=SEMI   initial pitch bend sensitivity in semitones; files
+                          can change it per channel with RPN 0 (default: ~a)
   -t, --tempo=BPM         tempo used when the file has no SET_TEMPO
                           events (default: ~a)
       --no-drums          skip percussion (MIDI channel 10) notes
@@ -196,8 +197,22 @@ file at sample rate RATE."
                              (lambda (key . rest)
                                (die "failed to parse '~a' (~a)" input key)))]
                [ticksPerQuarter (third (car midiEvents))])
-          (detail "  ~a events, ~a ticks per quarter note~%"
-                  (length midiEvents) ticksPerQuarter)
+          (detail "  ~a, ~a track~:p, ~a events~%"
+                  (MidiHeaderRef midiEvents #:format)
+                  (MidiHeaderRef midiEvents #:tracks)
+                  (length midiEvents))
+          (if (eq? (MidiHeaderRef midiEvents #:division) 'SMPTE)
+              (detail "  SMPTE timing: ~a frames/s, ~a ticks/frame~%"
+                      (exact->inexact (MidiHeaderRef midiEvents #:framesPerSecond))
+                      (MidiHeaderRef midiEvents #:ticksPerFrame))
+              (detail "  ~a ticks per quarter note~%" ticksPerQuarter))
+          (when verbose
+            (for-each (lambda (ev)
+                        (when (memq (car ev) '(TRACK_NAME COPYRIGHT_NOTICE))
+                          (format #t "  ~a: ~a~%"
+                                  (if (eq? (car ev) 'TRACK_NAME) "Track" "Copyright")
+                                  (cadr (memq #:text ev)))))
+                      midiEvents))
           (when (option-ref options 'dump-events #f)
             (pretty-print midiEvents))
 

@@ -35,16 +35,24 @@ more efficient when I get some spare time.
 
 ## MIDI 1.1 Support
 
-This renderer now supports the MIDI 1.1 specification, including:
+The parser handles the whole Standard MIDI File 1.1 format: formats
+0, 1 and 2, metrical and SMPTE timing, running status, every meta event,
+multi-packet SysEx and F7 escapes, unknown chunks, and truncated files.
 
-- **Pitch wheel control**: Pitch bend events are properly applied to notes with
-  a standard ±2 semitone range.
-- **Tempo changes**: Multiple tempo changes within a song are correctly handled.
-- **Extended meta events**: Support for all MIDI 1.1 meta events including:
-  - Text events (text, copyright, track name, instrument name, lyrics, markers, cue points)
-  - Program/Device name events
-  - MIDI Channel Prefix
-  - Sequencer-specific events
-- **Complete controller support**: All channel mode messages and control changes
-- **System Exclusive messages**: Proper parsing and handling of SysEx messages
+Playback goes through a 16-channel MIDI receiver model. It applies:
 
+- the pitch wheel continuously, including mid-note bends
+- RPN pitch bend sensitivity and fine/coarse tuning
+- volume, expression and master volume
+- sustain, sostenuto and soft pedals
+- modulation wheel and aftertouch (as vibrato)
+- portamento
+- All Notes Off and All Sound Off
+- Reset All Controllers, Mono/Poly mode, and General MIDI reset
+
+See [MIDI_1.1_COMPLIANCE.md](MIDI_1.1_COMPLIANCE.md) for the details and
+for what a mono chiptune renderer can't reproduce, such as pan.
+
+Run the tests with:
+
+    guile --no-auto-compile test-midi-1.1.scm

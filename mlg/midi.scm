@@ -1,455 +1,479 @@
+;;; (mlg midi) -- Standard MIDI File parser (MIDI 1.0 / SMF 1.1)
+;;;
+;;; ParseMidi returns a time-sorted list of events.  Every event is a
+;;; list whose head is a symbol naming the event, followed by keyword
+;;; arguments.  All events read from a track carry #:time (in ticks
+;;; since the start of the song) and #:track.  The first element of
+;;; the list is always a synthetic MTHD event describing the header:
+;;;
+;;;   (MTHD #:ticksPerQuarter N #:format F #:tracks T
+;;;         #:division METRICAL|SMPTE [#:framesPerSecond FPS
+;;;         #:ticksPerFrame TPF])
+;;;
+;;; For SMPTE files #:ticksPerQuarter holds ticks per *second* and
+;;; MidiEvents->TempoMap returns a single 1-second-per-quarter entry,
+;;; so the usual tick-to-seconds conversion yields absolute time.
+
 (define-module (mlg midi)
-  :use-module (srfi srfi-1)
-  :use-module (srfi srfi-11)
-  :use-module (rnrs io ports)
-  :use-module (mlg binports)
-  :use-module (ice-9 pretty-print)
-  :use-module (ice-9 optargs)
-  :export (ParseMidi
-	   ParseMidiFile
-           MidiEvents->TempoMap
-           midi-trace))
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-11)
+  #:use-module (rnrs io ports)
+  #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 optargs)
+  #:export (ParseMidi
+            ParseMidiFile
+            MidiEvents->TempoMap
+            MidiHeaderRef
+            midi-trace))
 
 ;; When true, the parser prints the track count and every event as it
 ;; is read.  Useful for debugging; off by default.
 (define midi-trace (make-parameter #f))
 
-(define V_NOTE_OFF #x80)
-(define V_NOTE_ON #x90)
-(define V_POLYPHONIC_AFTERTOUCH #xA0)
-(define V_CONTROL_CHANGE #xB0)
-(define V_PROGRAM_CHANGE #xC0)
-(define V_CHANNEL_AFTERTOUCH #xD0)
-(define V_PITCH_WHEEL_CONTROL #xE0)
+(define (warn fmt . args)
+  (apply format (current-error-port) (string-append "midi: " fmt "~%") args))
 
-(define S_SOX #xF0)
-(define S_MIDI_TIME_CODE #xF1)
-(define S_SONG_POSITION_POINTER #xF2)
-(define S_SONG_SELECT #xF3)
-(define S_TUNE_REQUEST #xF6)
-(define S_EOX #xF7)
-(define S_TIMING_CLOCK #xF8)
-(define S_START #xFA)
-(define S_CONTINUE #xFB)
-(define S_STOP #xFC)
-(define S_ACTIVE_SENSING #xFE)
-(define S_SYSTEM_RESET #xFF)
+;;; ------------------------------------------------------------------
+;;; Cursor over a bytevector
 
-(define (get-midi-var-int port)
-  "Unpacks a variable-length integer from the data store.  This
-integer is encoded such that the low 7-bits of each input byte are
-numerical data and the high bit indicates if another byte of data is
-expected.  Variable length integers never have more than 4 bytes."
-  (define (_Shift cur prev)
-    (logior (ash prev 7) (logand cur #x7F)))
+(define (make-cursor bv)
+  "Return a procedure that dispatches on a message symbol to read
+from BV.  Reading past the end throws 'midi-truncated."
+  (let ([pos 0]
+        [len (bytevector-length bv)])
+    (define (need n)
+      (when (> (+ pos n) len)
+        (throw 'midi-truncated pos)))
+    (lambda (msg . args)
+      (case msg
+        [(u8)
+         (need 1)
+         (let ([b (bytevector-u8-ref bv pos)])
+           (set! pos (1+ pos))
+           b)]
+        [(peek)
+         (need 1)
+         (bytevector-u8-ref bv pos)]
+        [(bytes)
+         (let* ([n (car args)]
+                [out (make-bytevector n)])
+           (need n)
+           (bytevector-copy! bv pos out 0 n)
+           (set! pos (+ pos n))
+           out)]
+        [(varint)
+         ;; Variable-length quantity: 7 bits per byte, high bit set
+         ;; on all but the last byte, at most 4 bytes.
+         (let loop ([val 0] [count 1])
+           (need 1)
+           (let ([b (bytevector-u8-ref bv pos)])
+             (set! pos (1+ pos))
+             (let ([val (logior (ash val 7) (logand b #x7F))])
+               (cond
+                [(not (logtest b #x80)) val]
+                [(>= count 4)
+                 (warn "variable-length quantity longer than 4 bytes")
+                 val]
+                [else (loop val (1+ count))]))))]
+        [(eof?) (>= pos len)]))))
 
-  (let ([bytes '()])
+(define (bytes->latin1 bv)
+  (list->string (map integer->char (bytevector->u8-list bv))))
 
-    (define (_AppendToBytesAndTestHigh)
-      (let ([cur (get-u8 port)])
-	(set! bytes (append bytes (list cur)))
-	(logtest cur #x80)))
+(define (subbytes bv start n)
+  (let ([out (make-bytevector n)])
+    (bytevector-copy! bv start out 0 n)
+    out))
 
-    (while (_AppendToBytesAndTestHigh))
+;;; ------------------------------------------------------------------
+;;; Header
 
-    (when (> (length bytes) 4)
-	  (error "Invalid MIDI variable-length number" bytes))
-    (fold _Shift 0 bytes)))
+(define (decode-division division)
+  "Return a property list describing the MThd division word."
+  (if (logtest division #x8000)
+      ;; SMPTE: the high byte is the negated frame rate (-24, -25,
+      ;; -29, -30) in two's complement; the low byte is ticks per
+      ;; frame.  -29 means 30 drop-frame, i.e. 29.97 frames/second.
+      (let* ([fps-code (- 256 (ash division -8))]
+             [tpf (logand division #xFF)]
+             [fps (if (= fps-code 29) 30000/1001 fps-code)])
+        (list #:ticksPerQuarter (* fps tpf)
+              #:division 'SMPTE
+              #:framesPerSecond fps
+              #:ticksPerFrame tpf))
+      (list #:ticksPerQuarter (if (zero? division) 96 division)
+            #:division 'METRICAL)))
 
-(define (ParseHeader port)
-  "Read a binary port and parsing the MIDI header contained therein."
-  (let* ([type (get-latin1-string port 4)]
-	 [length (get-u32-be port)]
-	 [format (get-u16-be port)]
-	 [tracks (get-u16-be port)]
-	 [division (get-u16-be port)])
-    (unless (string=? type "MThd")
-	    (error "Bad MIDI header string" type))
-    (unless (and (>= format 0) (<= format 2))
-	    (error "Bad MIDI format type" format))
+;;; ------------------------------------------------------------------
+;;; Meta events
 
-    ;; MIDI time divisions are in one of two formats, depending on the
-    ;; MSB.  If the high bit is zero, it is ticks per quarter note.
-    ;; If the high bit is one, it a SMPTE frame time.
-    (when (logtest division #x8000)
-	  ;; FIXME: the following isn't right because frames-per-second
-	  ;; has negative numbers and drop frames.
-	  (let ([ticksPerFrame (logand division #xFF)]
-		[framesPerSecond (ash division -8)])
-	    (set! division (* ticksPerFrame framesPerSecond))))
-    
-    ;; Return
-    (values (list-ref '(MIDI_FORMAT_0 MIDI_FORMAT_1 MIDI_FORMAT_2) format)
-	    tracks
-	    division)))
+(define text-meta-names
+  #(#f TEXT_EVENT COPYRIGHT_NOTICE TRACK_NAME INSTRUMENT_NAME LYRIC
+       MARKER CUE_POINT PROGRAM_NAME DEVICE_NAME))
 
-(define (ParseMetaEvent port channel)
-  (let ([byte1 (get-u8 port)]
-	[byte2 (get-u8 port)])
-    (cond 
-     [(and (eqv? byte1 #x00) (eqv? byte2 #x02))
-      (list 'SEQUENCE_NUMBER
-	    #:channel channel
-	    #:value (get-u16-be port))]
-     [(and (eqv? byte1 #x01))
-      (list 'TEXT_EVENT
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x02))
-      (list 'COPYRIGHT_NOTICE 
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x03))
-      (list 'TRACK_NAME 
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x04))
-      (list 'INSTRUMENT_NAME
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x05))
-      (list 'LYRIC
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x06))
-      (list 'MARKER
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x07))
-      (list 'CUE_POINT
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x08))
-      (list 'PROGRAM_NAME
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x09))
-      (list 'DEVICE_NAME
-	    #:channel channel
-	    #:text (get-latin1-string port byte2))]
-     [(and (eqv? byte1 #x20) (eqv? byte2 #x01))
-      (list 'MIDI_CHANNEL_PREFIX
-            #:channel channel
-            #:prefix (get-u8 port))]
-     [(and (eqv? byte1 #x21) (eqv? byte2 #x01))
-      (list 'MIDI_PORT
-            #:channel channel
-            #:port (get-u8 port))]
-     [(and (eqv? byte1 #x2F) (eqv? byte2 #x00))
-      (list 'END_OF_TRACK
-	    #:channel channel)]
-     [(and (eqv? byte1 #x51) (eqv? byte2 #x03))
-      (list 'SET_TEMPO
-	    #:channel channel
-	    #:microsecondsPerQuarter (logior (ash (get-u8 port) 16)
-					     (ash (get-u8 port) 8)
-					     (get-u8 port)))]
-     [(and (eqv? byte1 #x54) (eqv? byte2 #x05))
-      (list 'SMPTE_OFFSET
-	    #:channel channel
-	    #:hours (get-u8 port)
-	    #:minutes (get-u8 port)
-	    #:seconds (get-u8 port)
-	    #:frames (+ (get-u8 port) (* 0.01 (get-u8 port))))]
-
-     [(and (eqv? byte1 #x58) (eqv? byte2 #x04))
-      (list 'TIME_SIGNATURE
-	    #:channel channel 
-	    #:numerator (get-u8 port)
-	    #:denominator (list-ref '( 2 4 8 16 32 64) (get-u8 port))
-	    #:clocksPerClick (get-u8 port)
-	    #:thirtySecondNotesPerQuarter (get-u8 port))]
-
-     [(and (eqv? byte1 #x59) (eqv? byte2 #x02))
-      (let ((byte1 (get-s8 port))
-	    (byte2 (get-u8 port)))
-	(list 'KEY_SIGNATURE
-	      #:channel channel
-	      (if (< byte1 0)
-		  #:flats
-		  #:sharps)
-	      byte1
-	      #:tonality
-	      (if (eqv? 0 byte2)
-		  'MAJOR
-		  'MINOR)))]
-     [(and (eqv? byte1 #x7F))
-      ;; Sequencer-specific meta event
-      (let ([data (let loop ([i 0] [acc '()])
-                    (if (= i byte2)
-                        (reverse acc)
-                        (loop (1+ i) (cons (get-u8 port) acc))))])
-        (list 'SEQUENCER_SPECIFIC
-              #:channel channel
-              #:data data))]
+(define (decode-meta type data channel trackID)
+  (let ([n (bytevector-length data)])
+    (define (u8 i) (bytevector-u8-ref data i))
+    (cond
+     [(= type #x00)
+      ;; If the number is omitted it defaults to the track's position.
+      (list 'SEQUENCE_NUMBER #:channel channel
+            #:value (if (>= n 2) (logior (ash (u8 0) 8) (u8 1)) trackID))]
+     [(<= #x01 type #x09)
+      (list (vector-ref text-meta-names type) #:channel channel
+            #:text (bytes->latin1 data))]
+     [(<= #x0A type #x0F)
+      ;; Reserved text event types.
+      (list 'TEXT_EVENT #:channel channel #:metaType type
+            #:text (bytes->latin1 data))]
+     [(and (= type #x20) (>= n 1))
+      (list 'MIDI_CHANNEL_PREFIX #:channel channel #:prefix (u8 0))]
+     [(and (= type #x21) (>= n 1))
+      (list 'MIDI_PORT #:channel channel #:port (u8 0))]
+     [(= type #x2F)
+      (list 'END_OF_TRACK #:channel channel)]
+     [(and (= type #x51) (>= n 3))
+      (list 'SET_TEMPO #:channel channel
+            #:microsecondsPerQuarter
+            (logior (ash (u8 0) 16) (ash (u8 1) 8) (u8 2)))]
+     [(and (= type #x54) (>= n 5))
+      ;; The hours byte is 0rrhhhhh, where rr is a frame rate code.
+      (list 'SMPTE_OFFSET #:channel channel
+            #:framesPerSecond (vector-ref #(24 25 29.97 30)
+                                          (logand (ash (u8 0) -5) 3))
+            #:hours (logand (u8 0) #x1F)
+            #:minutes (u8 1)
+            #:seconds (u8 2)
+            #:frames (+ (u8 3) (* 0.01 (u8 4))))]
+     [(and (= type #x58) (>= n 4))
+      (list 'TIME_SIGNATURE #:channel channel
+            #:numerator (u8 0)
+            #:denominator (expt 2 (u8 1))
+            #:clocksPerClick (u8 2)
+            #:thirtySecondNotesPerQuarter (u8 3))]
+     [(and (= type #x59) (>= n 2))
+      (let ([sf (bytevector-s8-ref data 0)])
+        (list 'KEY_SIGNATURE #:channel channel
+              (if (< sf 0) #:flats #:sharps) sf
+              #:tonality (if (zero? (u8 1)) 'MAJOR 'MINOR)))]
+     [(= type #x7F)
+      (list 'SEQUENCER_SPECIFIC #:channel channel
+            #:data (bytevector->u8-list data))]
      [else
-      (do ([i 0 (1+ i)]) ([= i byte2])
-          (get-u8 port))
-      (format (current-error-port) "Unhandled meta event ~a len ~a~%" byte1 byte2)
-      (list 'META #:channel channel #:byte1 byte1)])))
+      ;; Unknown meta events must be ignored by players, but keep
+      ;; them in the event list for inspection.
+      (list 'META #:channel channel #:metaType type
+            #:data (bytevector->u8-list data))])))
 
+;;; ------------------------------------------------------------------
+;;; System common / real-time messages
 
-(define (ParseEvent port track lastStatus)
-  "Extract a single MIDI event."
-  
-  (define (_HiTest x y)
-    (eqv? (logand x #xF0) (logand y #xF0)))
-  
-  (define (_LoVal x)
-    (logand x #x0F))
+(define (system-message-length status)
+  (case status
+    [(#xF1 #xF3) 1]
+    [(#xF2) 2]
+    [else 0]))
 
-  (define (_ListToString lst)
-    (apply string (map integer->char lst)))
-  
-  (let* ([deltaTime (get-midi-var-int port)]
-	 [status (if (< (lookahead-u8 port) #x80)
-                     lastStatus
-                     (get-u8 port))])
-    (values
-     deltaTime
-     status
+(define (decode-system status data)
+  "Decode a system common or system real-time message.  DATA is a
+list of the data bytes."
+  (case status
+    [(#xF1)
+     (let ([v (if (pair? data) (car data) 0)])
+       (list 'TIME_CODE_QUARTER_FRAME
+             #:scale (vector-ref #(FRAME_BITS_ZERO_TO_THREE
+                                   FRAME_BITS_FOUR_TO_SEVEN
+                                   SECONDS_BITS_ZERO_TO_THREE
+                                   SECONDS_BITS_FOUR_TO_SEVEN
+                                   MINUTES_BITS_ZERO_TO_THREE
+                                   MINUTES_BITS_FOUR_TO_SEVEN
+                                   HOURS_BITS_ZERO_TO_THREE
+                                   HOURS_BITS_FOUR_TO_SEVEN)
+                                 (logand (ash v -4) 7))
+             #:value (logand v #x0F)))]
+    [(#xF2)
+     (list 'SONG_POSITION_POINTER
+           #:beat (if (>= (length data) 2)
+                      (logior (ash (cadr data) 7) (car data))
+                      0))]
+    [(#xF3) (list 'SONG_SELECT #:song (if (pair? data) (car data) 0))]
+    [(#xF6) (list 'TUNE_REQUEST)]
+    [(#xF8) (list 'TIMING_CLOCK)]
+    [(#xFA) (list 'START)]
+    [(#xFB) (list 'CONTINUE)]
+    [(#xFC) (list 'STOP)]
+    [(#xFE) (list 'ACTIVE_SENSING)]
+    [(#xFF) (list 'SYSTEM_RESET)]
+    [else (list 'UNDEFINED_SYSTEM #:status status #:data data)]))
 
-     (cond
-      [(eqv? status S_SOX)
-       (let loop ([byte (get-u8 port)]
-		  [lst '()])
-	 (if (not (eqv? byte S_EOX))
-	     (loop (get-u8 port)
-		   (append lst (list byte)))
-	     (list 'SOX
-		   #:channel (_LoVal status)
-		   #:message lst)))]
-      
-      [(eqv? status S_MIDI_TIME_CODE)
-       (let* ([value (get-u8 port)])
-	 (list 'TIME_CODE_QUARTER_FRAME
-	       #:channel (_LoVal status)
-	       #:scale
-	       (cond 
-		((_HiTest value #x00)
-		 'FRAME_BITS_ZERO_TO_THREE)
-		((_HiTest value #x10)
-		 'FRAME_BITS_FOUR_TO_SEVEN)
-		((_HiTest value #x20)
-		 'SECONDS_BITS_ZERO_TO_THREE)
-		((_HiTest value #x30)
-		 'SECONDS_BITS_FOUR_TO_SEVEN)
-		((_HiTest value #x40)
-		 'MINUTES_BITS_ZERO_TO_THREE)
-		((_HiTest value #x50)
-		 'MINUTES_BITS_FOUR_TO_SEVEN)
-		((_HiTest value #x60)
-		 'HOURS_BITS_ONE_TO_THREE)
-		((_HiTest value #x70)
-		 'HOURS_BITS_FOUR_TO_SEVEN))
-	       #:value value))]
+;;; ------------------------------------------------------------------
+;;; Channel messages
 
-      [(eqv? status S_SONG_POSITION_POINTER)
-       (let ([lo (get-u8 port)]
-	     [hi (get-u8 port)])
-	 (list 'SONG_POSITION_POINTER
-	       #:channel (_LoVal status)
-	       #:beat (logior (ash hi 7) lo)))]
-      
-      [(eqv? status S_SONG_SELECT)
-       (list 'SONG_SELECT
-	     #:channel (_LoVal status)
-	     #:song (get-u8 port))]
-      
-      [(eqv? status S_TUNE_REQUEST)
-       (list 'TUNE_REQUEST)]
-      
-      [(eqv? status S_TIMING_CLOCK)
-       (list 'TIMING_CLOCK)]
-      
-      [(eqv? status S_START)
-       (list 'START)]
-      
-      [(eqv? status S_CONTINUE)
-       (list 'CONTINUE)]
-      
-      [(eqv? status S_STOP)
-       (list 'STOP)]
-      
-      [(eqv? status S_ACTIVE_SENSING)
-       (list 'ACTIVE_SENSING)]
-      
-      ((eqv? status S_SYSTEM_RESET)
-       (if (not (logtest (lookahead-u8 port) #x80))
-	   (ParseMetaEvent port (_LoVal status))
-	   ;; else
-	   (list 'SYSTEM_RESET)))
-      
-      [(_HiTest status V_NOTE_OFF)
-       (list 'NOTE_OFF
-             #:track track
-	     #:channel (_LoVal status)
-	     #:key (get-u8 port)
-	     #:velocity (get-u8 port))]
+(define (channel-message-length status)
+  (case (logand status #xF0)
+    [(#xC0 #xD0) 1]
+    [else 2]))
 
-      [(_HiTest status V_NOTE_ON)
-       (let ([key (get-u8 port)]
-             [velocity (get-u8 port)])
-         (if (eqv? velocity 0)
-             (list 'NOTE_OFF
-                   #:track track
-                   #:channel (_LoVal status)
-                   #:key key
-                   #:velocity velocity)
-             ;; else
-             (list 'NOTE_ON
-                   #:track track
-                   #:channel (_LoVal status)
-                   #:key key
-                   #:velocity velocity)))]
+(define (decode-channel status d1 d2)
+  (let ([ch (logand status #x0F)])
+    (case (logand status #xF0)
+      [(#x80)
+       (list 'NOTE_OFF #:channel ch #:key d1 #:velocity d2)]
+      [(#x90)
+       ;; A NOTE_ON with velocity zero is a NOTE_OFF.
+       (list (if (zero? d2) 'NOTE_OFF 'NOTE_ON)
+             #:channel ch #:key d1 #:velocity d2)]
+      [(#xA0)
+       (list 'KEY_PRESSURE #:channel ch #:key d1 #:pressure d2)]
+      [(#xB0)
+       (case d1
+         ;; Channel mode messages.  Receivers should act on them
+         ;; whatever the second byte says, so decode leniently.
+         [(120) (list 'ALL_SOUND_OFF #:channel ch #:value d2)]
+         [(121) (list 'RESET_ALL_CONTROLLERS #:channel ch #:value d2)]
+         [(122) (list (if (< d2 64) 'LOCAL_CONTROL_OFF 'LOCAL_CONTROL_ON)
+                      #:channel ch #:value d2)]
+         [(123) (list 'ALL_NOTES_OFF #:channel ch #:value d2)]
+         [(124) (list 'OMNI_MODE_OFF #:channel ch #:value d2)]
+         [(125) (list 'OMNI_MODE_ON #:channel ch #:value d2)]
+         [(126) (list 'MONO_MODE_ON #:channel ch #:value d2)]
+         [(127) (list 'POLY_MODE_ON #:channel ch #:value d2)]
+         [else (list 'CONTROL_CHANGE #:channel ch #:controller d1 #:value d2)])]
+      [(#xC0)
+       (list 'PROGRAM_CHANGE #:channel ch #:patch d1)]
+      [(#xD0)
+       (list 'CHANNEL_PRESSURE #:channel ch #:pressure d1)]
+      [(#xE0)
+       (list 'PITCH_WHEEL #:channel ch #:value (logior (ash d2 7) d1))])))
 
-      [(_HiTest status V_POLYPHONIC_AFTERTOUCH)
-       (list 'KEY_PRESSURE
-	     #:channel (_LoVal status)
-	     #:key (get-u8 port)
-	     #:pressure (get-u8 port))]
+;;; ------------------------------------------------------------------
+;;; Tracks
 
-      [(_HiTest status V_CONTROL_CHANGE)
-       (let* ([controller (get-u8 port)]
-	      [value (get-u8 port)])
-	 (cond
-	  [(and (eqv? controller 120) (eqv? value 0))
-	   (list 'ALL_SOUND_OFF
-		 #:channel (_LoVal status))]
-	  [(eqv? controller 121)
-	   (list 'RESET_ALL_CONTROLLERS
-		 #:channel (_LoVal status)
-		 #:value value)]
-	  [(and (eqv? controller 122) (eqv? value 0))
-	   (list 'LOCAL_CONTROL_OFF
-		 #:channel (_LoVal status))]
-	  [(and (eqv? controller 122) (eqv? value 127))
-	   (list 'LOCAL_CONTROL_ON
-		 #:channel (_LoVal status))]
-	  [(and (eqv? controller 123) (eqv? value 0))
-	   (list 'ALL_NOTES_OFF
-		 #:channel (_LoVal status))]
-	  [(and (eqv? controller 124) (eqv? value 0))
-	   (list 'OMNI_MODE_OFF
-		 #:channel (_LoVal status))]
-	  [(and (eqv? controller 125) (eqv? value 0))
-	   (list 'OMNI_MODE_ON
-		 #:channel (_LoVal status))]
-	  [(eqv? controller 126)
-	   (list 'MONO_MODE_ON
-		 #:channel (_LoVal status)
-		 #:value value)]
-	  [(and (eqv? controller 127) (eqv? value 0))
-	   (list 'POLY_MODE_ON
-		 #:channel (_LoVal status))]
-	  [(< controller 120)
-	   (list 'CONTROL_CHANGE
-		 #:channel (_LoVal status)
-		 #:controller controller
-		 #:value value)]
-	  [else
-	   (error "Bad channel mode message" controller value)]))]
+(define (ParseTrack bv trackID)
+  "Parse the body of one MTrk chunk.  Returns two values: the list
+of events in file order and the track's end time in ticks."
+  (let ([rd (make-cursor bv)]
+        [running #f]            ; running status (channel messages only)
+        [prefix #f]             ; MIDI channel prefix for meta/sysex
+        [sysex-open #f]         ; inside a multi-packet SysEx?
+        [now 0]
+        [events '()]
+        [warned-orphan #f])
 
-      [(_HiTest status V_PROGRAM_CHANGE)
-       (list 'PROGRAM_CHANGE
-	     #:channel (_LoVal status)
-	     #:patch (get-u8 port))]
-      [(_HiTest status V_CHANNEL_AFTERTOUCH)
-       (list 'CHANNEL_PRESSURE 
-	     #:channel (_LoVal status)
-	     #:pressure (get-u8 port))]
-      [(_HiTest status V_PITCH_WHEEL_CONTROL)
-       (let ([lo (get-u8 port)]
-	     [hi (get-u8 port)])
-	 (list 'PITCH_WHEEL 
-	       #:channel (_LoVal status)
-	       #:value (logior (ash hi 7) lo)))]
-      [else
-       (format (current-error-port) "Unhandled event ~a~%" status)
-       (list 'JUNK)]))))
+    (define (emit! ev)
+      (let ([ev (cons* (car ev) #:time now #:track trackID (cdr ev))])
+        (when (midi-trace)
+          (display "E: ") (write ev) (newline))
+        (set! events (cons ev events))))
 
-(define (ParseTrack port trackID ticksPerQuarter)
-  "Extract one track's set of MIDI events."
-  (let* ([type (get-latin1-string port 4)]
-	 [length (get-u32-be port)]
-	 [trackEnd (+ length (port-position port))]
-	 [eventList '()]
-         [lastStatus #f]
-	 [now 0])
-    (unless (string=? type "MTrk")
-	    (error "Bad MIDI track header string" type))
-    (while #t ; (< (port-position port) trackEnd)
-	   ;; Get the next MIDI event and the time difference
-	   ;; (in MIDI ticks) since the last MIDI event.
-	   (let-values ([(deltaTime curStatus event) (ParseEvent port trackID lastStatus)])
-             (set! lastStatus curStatus)
-	     ;; Splice extra information about the current time and
-	     ;; track into the MIDI event.
-	     (set! now (+ now deltaTime))
-	     (set! event
-		   (append
-		    (list (car event))	; The type of the event
-		    (list #:time now)	; Time since beginning of song
-		    (list #:track trackID)
-		    (cdr event)))	; The details of the event
-	     (when (midi-trace)
-	       (display "E: ") (write event) (newline))
-	     (set! eventList
-		   (append! eventList (list event)))
-             (when (eqv? 'END_OF_TRACK (car event))
-                   (break))))
-    ;; (pretty-print eventList)
-    eventList))
+    (define (read-data-list n)
+      (let loop ([i 0] [acc '()])
+        (if (= i n) (reverse acc) (loop (1+ i) (cons (rd 'u8) acc)))))
+
+    (define (sysex-packet data)
+      ;; Returns (message . complete?) for a SysEx packet body.
+      (let ([complete (and (pair? data) (= (last data) #xF7))])
+        (cons (if complete (drop-right data 1) data) complete)))
+
+    (catch 'midi-truncated
+      (lambda ()
+        (let loop ()
+          (unless (rd 'eof?)
+            (set! now (+ now (rd 'varint)))
+            (let ([b (rd 'peek)])
+              (cond
+               ;; Running status: a data byte where a status byte was
+               ;; expected repeats the previous channel status.
+               [(< b #x80)
+                (if running
+                    (let* ([d1 (rd 'u8)]
+                           [d2 (if (= 2 (channel-message-length running))
+                                   (rd 'u8) 0)])
+                      (emit! (decode-channel running d1 d2)))
+                    (begin
+                      (rd 'u8)
+                      (unless warned-orphan
+                        (warn "track ~a: data byte without running status" trackID)
+                        (set! warned-orphan #t))))
+                (loop)]
+
+               ;; Channel voice or channel mode message.
+               [(< b #xF0)
+                (rd 'u8)
+                (set! running b)
+                (let* ([d1 (rd 'u8)]
+                       [d2 (if (= 2 (channel-message-length b)) (rd 'u8) 0)])
+                  (emit! (decode-channel b d1 d2)))
+                (loop)]
+
+               ;; Meta event: FF type length data.  Meta and SysEx
+               ;; events never become the running status.
+               [(= b #xFF)
+                (rd 'u8)
+                (let* ([type (rd 'u8)]
+                       [len (rd 'varint)]
+                       [data (rd 'bytes len)]
+                       [ev (decode-meta type data prefix trackID)])
+                  (emit! ev)
+                  (when (eq? (car ev) 'MIDI_CHANNEL_PREFIX)
+                    (set! prefix (bytevector-u8-ref data 0)))
+                  ;; Nothing after End of Track is meaningful.
+                  (unless (eq? (car ev) 'END_OF_TRACK)
+                    (loop)))]
+
+               ;; SysEx: F0 length data.  If the data does not end
+               ;; with F7, the message continues in later F7 packets.
+               [(= b #xF0)
+                (rd 'u8)
+                (let ([pkt (sysex-packet (read-data-list (rd 'varint)))])
+                  (emit! (list 'SOX #:channel prefix
+                               #:message (car pkt) #:complete (cdr pkt)))
+                  (set! sysex-open (not (cdr pkt))))
+                (loop)]
+
+               ;; F7 length data: a SysEx continuation packet, or an
+               ;; escape carrying arbitrary bytes such as real-time or
+               ;; system common messages.
+               [(= b #xF7)
+                (rd 'u8)
+                (let ([data (read-data-list (rd 'varint))])
+                  (cond
+                   [sysex-open
+                    (let ([pkt (sysex-packet data)])
+                      (emit! (list 'SOX_CONTINUATION #:channel prefix
+                                   #:message (car pkt) #:complete (cdr pkt)))
+                      (set! sysex-open (not (cdr pkt))))]
+                   [(and (pair? data) (>= (car data) #xF1) (<= (car data) #xFF))
+                    (emit! (decode-system (car data) (cdr data)))]
+                   [else
+                    (emit! (list 'SYSEX_ESCAPE #:channel prefix #:data data))]))
+                (loop)]
+
+               ;; Bare system common / real-time bytes are not legal
+               ;; in an SMF, but decode them if they turn up.  They do
+               ;; not affect running status.
+               [else
+                (rd 'u8)
+                (emit! (decode-system b (read-data-list (system-message-length b))))
+                (loop)])))))
+      (lambda (key . args)
+        (warn "track ~a is truncated; using the events read so far" trackID)))
+
+    (values (reverse events) now)))
+
+;;; ------------------------------------------------------------------
+;;; Files
+
+(define (read-chunk port)
+  "Read one chunk header and body.  Returns (type . body), or #f at
+end of file.  A short body is returned as far as it goes."
+  (let ([hdr (get-bytevector-n port 8)])
+    (if (or (eof-object? hdr) (< (bytevector-length hdr) 8))
+        #f
+        (let* ([type (bytes->latin1 (subbytes hdr 0 4))]
+               [len (bytevector-u32-ref hdr 4 (endianness big))]
+               [body (get-bytevector-n port len)])
+          (cons type (if (eof-object? body) (make-bytevector 0) body))))))
+
+(define (skip-riff-wrapper! port)
+  "Handle RMID files (a Standard MIDI File inside a RIFF 'data'
+chunk).  Leaves PORT positioned at the MThd chunk."
+  (when (port-has-port-position? port)
+    (let* ([pos (port-position port)]
+           [peek (get-bytevector-n port 4)])
+      (set-port-position! port pos)
+      (when (and (bytevector? peek) (= 4 (bytevector-length peek))
+                 (string=? (bytes->latin1 peek) "RIFF"))
+        (get-bytevector-n port 12)      ; "RIFF" size "RMID"
+        (let loop ()
+          (let ([hdr (get-bytevector-n port 8)])
+            (when (and (bytevector? hdr) (= 8 (bytevector-length hdr)))
+              (let ([id (bytes->latin1 (subbytes hdr 0 4))]
+                    [len (bytevector-u32-ref hdr 4 (endianness little))])
+                (unless (string=? id "data")
+                  (get-bytevector-n port (+ len (logand len 1)))
+                  (loop))))))))))
+
+(define (event-time ev)
+  ;; Every track event is (TYPE #:time T ...).
+  (caddr ev))
 
 (define (ParseMidi port)
-  "Extract MIDI events for all tracks from a port."
+  "Extract MIDI events for all tracks from a binary input port."
+  (skip-riff-wrapper! port)
+  (let ([header (read-chunk port)])
+    (unless (and header (string=? (car header) "MThd")
+                 (>= (bytevector-length (cdr header)) 6))
+      (error "Not a Standard MIDI File (missing MThd header)"))
+    ;; The header may be longer than 6 bytes in future versions; the
+    ;; extra bytes are ignored.
+    (let* ([hb (cdr header)]
+           [format (bytevector-u16-ref hb 0 (endianness big))]
+           [trackCount (bytevector-u16-ref hb 2 (endianness big))]
+           [division (decode-division (bytevector-u16-ref hb 4 (endianness big)))])
+      (unless (<= format 2)
+        (warn "unknown SMF format ~a; treating it as format 1" format))
+      (when (midi-trace)
+        (format #t "Track Count: ~a~%" trackCount))
 
-  (define (_ExtractTime x)
-    "Get the time (in MIDI clicks) from a MIDI event."
-    (let-keywords (cdr x) #t
-                  ([time -1])
-                  time))
-
-  (define (_TimeCompare a b)
-    "Compare two MIDI events by their times (in MIDI clicks)."
-    (< (_ExtractTime a) (_ExtractTime b)))
-  
-  (let-values ([(midiFormat trackCount ticksPerQuarter) (ParseHeader port)])
-    (when (midi-trace)
-      (format #t "Track Count: ~a~%" trackCount))
-    (let ([midiEvents '()])
-      ;; Add a fake MIDI event with the header data, mostly because we
-      ;; need ticksPerQuarter
-      (set! midiEvents
-            (list
-             (list 'MTHD #:ticksPerQuarter ticksPerQuarter)))
-      
-      ;; Now read each track's MIDI events.
-      (do ([i 0 (1+ i)]) ([= i trackCount])
-        (when (not (eof-object? (lookahead-u8 port)))
-              (set! midiEvents
-                    (append midiEvents
-                            (ParseTrack port i ticksPerQuarter)))))
-
-      ;; Merge the tracks into a single time-sorted list.
-      (stable-sort midiEvents _TimeCompare))))
+      ;; Read every MTrk chunk.  Chunks of other types are skipped.
+      (let loop ([trackID 0] [offset 0] [tracks '()])
+        (let ([chunk (read-chunk port)])
+          (cond
+           [(not chunk)
+            (unless (= trackID trackCount)
+              (warn "header promises ~a tracks but the file has ~a"
+                    trackCount trackID))
+            (let ([hdr (cons* 'MTHD
+                              (append division
+                                      (list #:format
+                                            (list-ref '(MIDI_FORMAT_0
+                                                        MIDI_FORMAT_1
+                                                        MIDI_FORMAT_2)
+                                                      (if (<= format 2) format 1))
+                                            #:tracks trackID)))])
+              ;; Merge into one time-ordered list.  The sort is
+              ;; stable, so simultaneous events keep track order.
+              (cons hdr (stable-sort (concatenate (reverse tracks))
+                                     (lambda (a b)
+                                       (< (event-time a) (event-time b))))))]
+           [(string=? (car chunk) "MTrk")
+            (let-values ([(events end) (ParseTrack (cdr chunk) trackID)])
+              ;; Format 2 tracks are independent sequences played one
+              ;; after another, so shift each by the preceding ones.
+              (let ([events (if (and (= format 2) (positive? offset))
+                                (map (lambda (ev)
+                                       (cons* (car ev) #:time
+                                              (+ offset (event-time ev))
+                                              (cdddr ev)))
+                                     events)
+                                events)])
+                (loop (1+ trackID)
+                      (if (= format 2) (+ offset end) offset)
+                      (cons events tracks))))]
+           [else
+            (loop trackID offset tracks)]))))))
 
 (define (ParseMidiFile filename)
-  (ParseMidi (open-file-input-port filename)))
+  (call-with-port (open-file-input-port filename) ParseMidi))
+
+(define* (MidiHeaderRef midiEvents key #:optional default)
+  "Look up KEY (a keyword such as #:format) in the MTHD header event
+at the head of MIDIEVENTS."
+  (let ([m (memq key (cdar midiEvents))])
+    (if m (cadr m) default)))
 
 (define (MidiEvents->TempoMap midiEvents)
-  "Given a list of midi events as generated by ParseMidi,
-it looks for SET_TEMPO events and generates a mapping from
-MIDI clicks to seconds."
-  (define (_IsSetTempo x)
-    (eqv? 'SET_TEMPO (car x)))
-
-  (define (_ExtractTempoEntry x)
-    (let-keywords (cdr x) #t
-                  ([time -1]
-                   [microsecondsPerQuarter -1])
-                  (cons time microsecondsPerQuarter)))
-
-  (let ([tempoEvents (filter _IsSetTempo midiEvents)])
-    (map-in-order _ExtractTempoEntry tempoEvents)))
-
+  "Given a list of MIDI events as generated by ParseMidi, return an
+alist mapping tick -> microseconds per quarter note, one entry per
+SET_TEMPO event.  For SMPTE-timed files tempo is irrelevant, so a
+single (0 . 1000000) entry is returned; ticksPerQuarter then holds
+ticks per second."
+  (if (eq? (MidiHeaderRef midiEvents #:division) 'SMPTE)
+      (list (cons 0 1000000))
+      (filter-map (lambda (ev)
+                    (and (eq? (car ev) 'SET_TEMPO)
+                         (let-keywords (cdr ev) #t
+                             ([time 0] [microsecondsPerQuarter 500000])
+                           (cons time microsecondsPerQuarter))))
+                  midiEvents)))
