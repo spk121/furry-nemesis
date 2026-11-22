@@ -272,17 +272,41 @@ by start time."
   (define tempo (if smpte? 1000000 (default-tempo)))
   (define master 1.0)
   (define now 0)
-  (define active '())                   ; key down or held by a pedal
-  (define releasing '())                ; ended, still in release tail
+  ;; Sounding notes, kept per channel so that a controller change
+  ;; finds its channel's notes without copying or filtering lists.
+  (define active (make-vector 16 '()))    ; key down or held by a pedal
+  (define releasing (make-vector 16 '())) ; ended, still in release tail
   (define finished '())
+  ;; Earliest tail end among releasing notes, or #f when none.
+  (define next-expiry #f)
 
   (define (tail-ticks)
     (inexact->exact (ceiling (/ (* TAIL_SECONDS 1e6 tpq) tempo))))
 
-  (define (live-on c)
-    (filter (lambda (tg) (= (tg-channel tg) c)) (append active releasing)))
+  (define (for-each-live c proc)
+    (for-each proc (vector-ref active c))
+    (for-each proc (vector-ref releasing c)))
   (define (active-on c)
-    (filter (lambda (tg) (= (tg-channel tg) c)) active))
+    (vector-ref active c))
+
+  (define (expire!)
+    ;; Notes whose release tail has passed take no more changes:
+    ;; move them to FINISHED.  Called only when the earliest tail end
+    ;; has passed, so ordinary events do no list work here.
+    (set! next-expiry #f)
+    (do ([c 0 (1+ c)]) ((= c 16))
+      (vector-set! releasing c
+                   (let loop ([tgs (vector-ref releasing c)] [keep '()])
+                     (cond
+                      [(null? tgs) keep]
+                      [(< (tg-tail-end (car tgs)) now)
+                       (set! finished (cons (car tgs) finished))
+                       (loop (cdr tgs) keep)]
+                      [else
+                       (let ([te (tg-tail-end (car tgs))])
+                         (when (or (not next-expiry) (< te next-expiry))
+                           (set! next-expiry te)))
+                       (loop (cdr tgs) (cons (car tgs) keep))])))))
 
   (define (refresh! c)
     ;; Record the channel's current pitch, gain, vibrato and pan on
@@ -291,14 +315,13 @@ by start time."
            [pitch (channel-pitch ch)]
            [gain (channel-gain ch master)]
            [pan (channel-pan ch)])
-      (for-each (lambda (tg)
+      (for-each-live c (lambda (tg)
                   (unless (tg-perc tg)
                     (set-tg-pitch! tg (curve-push (tg-pitch tg) now pitch))
                     (set-tg-mod! tg (curve-push (tg-mod tg) now
                                                 (channel-mod ch (tg-key tg)))))
                   (set-tg-gain! tg (curve-push (tg-gain tg) now gain))
-                  (set-tg-pan! tg (curve-push (tg-pan tg) now pan)))
-                (live-on c))))
+                  (set-tg-pan! tg (curve-push (tg-pan tg) now pan))))))
 
   (define (refresh-all!)
     (for-each refresh! (iota 16)))
@@ -307,8 +330,11 @@ by start time."
     (set-tg-end! tg now)
     (set-tg-end-vel! tg vel)
     (set-tg-tail-end! tg (+ now (tail-ticks)))
-    (set! active (delq tg active))
-    (set! releasing (cons tg releasing)))
+    (let ([c (tg-channel tg)])
+      (vector-set! active c (delq tg (vector-ref active c)))
+      (vector-set! releasing c (cons tg (vector-ref releasing c))))
+    (when (or (not next-expiry) (< (tg-tail-end tg) next-expiry))
+      (set! next-expiry (tg-tail-end tg))))
 
   (define (note-off! tg vel)
     ;; Key released: the note ends unless a pedal holds it.
@@ -340,9 +366,9 @@ by start time."
     ;; Silence immediately, ignoring pedals and release envelopes.
     (for-each (lambda (tg) (end-note! tg 0)) (active-on c))
     (for-each (lambda (tg)
-                (when (and (= (tg-channel tg) c) (not (tg-stop tg)))
+                (unless (tg-stop tg)
                   (set-tg-stop! tg now)))
-              releasing))
+              (vector-ref releasing c)))
 
   (define (reset-controllers! c)
     ;; Recommended Practice RP-015: volume, pan, bank, program and
@@ -458,7 +484,7 @@ by start time."
                            #f 0 #f #f)])
         (set-ch-porta-key! ch #f)
         (set-ch-last-key! ch key)
-        (set! active (cons tg active)))))
+        (vector-set! active c (cons tg (vector-ref active c))))))
 
   (define (universal-sysex! msg)
     ;; MSG excludes the leading F0 and trailing F7.
@@ -479,22 +505,17 @@ by start time."
       (define (arg k default)
         (let ([m (memq k args)]) (if m (cadr m) default)))
       (set! now (arg #:time now))
-      ;; Notes whose release tail has passed take no more changes.
-      (when (pair? releasing)
-        (let-values ([(done still) (partition (lambda (tg) (< (tg-tail-end tg) now))
-                                              releasing)])
-          (set! finished (append done finished))
-          (set! releasing still)))
+      (when (and next-expiry (< next-expiry now))
+        (expire!))
       (let ([c (arg #:channel #f)])
         (case type
           [(NOTE_ON)
            (note-on! c (arg #:key 60) (arg #:velocity 64) (arg #:track 0))]
           [(NOTE_OFF)
            (let ([tg (find (lambda (tg)
-                             (and (= (tg-channel tg) c)
-                                  (= (tg-key tg) (arg #:key -1))
+                             (and (= (tg-key tg) (arg #:key -1))
                                   (eq? (tg-state tg) 'on)))
-                           active)])
+                           (vector-ref active c))])
              (when tg (note-off! tg (arg #:velocity 0))))]
           [(KEY_PRESSURE)
            (let ([ch (chan c)])
@@ -537,9 +558,19 @@ by start time."
 
   (for-each process! (cdr midiEvents))
   ;; Anything still sounding at the end of the song ends there.
-  (for-each (lambda (tg) (end-note! tg 0)) active)
-  (stable-sort (map tg->note (append finished releasing))
-               (lambda (a b) (< (note-time a) (note-time b)))))
+  (do ([c 0 (1+ c)]) ((= c 16))
+    (for-each (lambda (tg) (end-note! tg 0)) (vector-ref active c)))
+  (stable-sort (map tg->note
+                    (fold (lambda (c acc) (append (vector-ref releasing c) acc))
+                          finished (iota 16)))
+               ;; Order by start time, then channel and key, so the
+               ;; result does not depend on internal bookkeeping.
+               (lambda (a b)
+                 (or (< (note-time a) (note-time b))
+                     (and (= (note-time a) (note-time b))
+                          (or (< (note-channel a) (note-channel b))
+                              (and (= (note-channel a) (note-channel b))
+                                   (< (note-key a) (note-key b)))))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Ticks to seconds

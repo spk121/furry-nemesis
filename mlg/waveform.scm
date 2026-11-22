@@ -3,6 +3,7 @@
   #:use-module (mlg notelist)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-11)
   #:export (NoteList->PCM
             sample-rate
             output-channels))
@@ -94,22 +95,56 @@ calls must use non-decreasing T."
               (set! rest (cdr rest)))
             (cdar rest))))))
 
-(define* (GeneratePCM D_attack D_decay D_sustain D_release
+;;; ------------------------------------------------------------------
+;;; Voice rendering
+;;;
+;;; Every voice is added straight into one preallocated mix bus: a
+;;; bytevector of 32-bit floats holding the whole song, with
+;;; (output-channels) interleaved channels.  Nothing is allocated per
+;;; note or per sample, and samples are rounded to 16-bit integers
+;;; only once, when the finished bus is converted (see NoteList->PCM).
+
+(define (bus-frames bus nch)
+  (quotient (bytevector-length bus) (* 4 nch)))
+
+(define* (GeneratePCM bus start-frame nch
+                      D_attack D_decay D_sustain D_release
                       F_initial F_attack F_sustain F_release
                       A_attack A_sustain duty noise waveform
                       #:key (pitch-curve '()) (gain-curve '())
-                      (mod-curve '()) (glide #f))
-  "Given an ADSR envelope, generate a waveform (12-bit signed).  The
-optional curves modulate it over time: PITCH-CURVE in semitones,
-GAIN-CURVE as a linear factor and MOD-CURVE as vibrato depth 0..1.
-GLIDE is (semitones . seconds): start that far from the target pitch
-and slide to it."
-  (let* ([D_total (+ D_attack D_decay D_sustain D_release)]
-         [len (inexact->exact (ceiling (* D_total (sample-rate))))]
-         [buf (make-bytevector (* len 2))]
+                      (mod-curve '()) (glide #f) (pan-curve '()) (stop #f))
+  "Render one voice with an ADSR envelope (12-bit amplitude scale) and
+add it into BUS starting at START-FRAME.  The optional curves modulate
+it over time: PITCH-CURVE in semitones, GAIN-CURVE as a linear factor,
+MOD-CURVE as vibrato depth 0..1 and, for stereo buses, PAN-CURVE as
+(left . right) gains.  GLIDE is (semitones . seconds): start that far
+from the target pitch and slide to it.  STOP, in seconds, cuts the
+voice off early."
+  (let* ([sr (exact->inexact (sample-rate))]
+         [dt (/ 1.0 sr)]
+         [D_attack (exact->inexact D_attack)]
+         [D_decay (exact->inexact D_decay)]
+         [D_sustain (exact->inexact D_sustain)]
+         [D_release (exact->inexact D_release)]
+         [D_ad (+ D_attack D_decay)]
+         [D_ads (+ D_ad D_sustain)]
+         [D_total (+ D_ads D_release)]
+         [len (inexact->exact (ceiling (* D_total sr)))]
+         [len (if stop (min len (inexact->exact (floor (* stop sr)))) len)]
+         [len (max 0 (min len (- (bus-frames bus nch) start-frame)))]
+         [stereo (= nch 2)]
+         [square (eqv? waveform 0)]
+         [noisy (= noise 1)]
+         [duty (exact->inexact duty)]
+         [A_attack (exact->inexact A_attack)]
+         [A_sustain (exact->inexact A_sustain)]
          [pitch-at (make-step-reader pitch-curve 0.0)]
          [gain-at (make-step-reader gain-curve 1.0)]
-         [mod-at (make-step-reader mod-curve 0.0)])
+         [mod-at (make-step-reader mod-curve 0.0)]
+         ;; Pan points not yet reached, as a list of (time . gains).
+         [pan-rest (if (and stereo (pair? pan-curve)) pan-curve '())]
+         [pan-gains-now (pan-gains 64 64)])
+
     (define (pitch-offset t)
       (+ (pitch-at t)
          (if (and glide (< t (cdr glide)))
@@ -119,74 +154,113 @@ and slide to it."
            (if (zero? depth)
                0.0
                (* depth VIBRATO_DEPTH (sin (* 2 PI VIBRATO_RATE t)))))))
-    (let ([t 0.0] [t_start 0.0]
-          [i 0]
-          [period 0.0]
-          [first #t]
-          [amplitude 0.0] [frequency 0.0]
-          [level-a 0.0] [level-b 0.0])
-      (while (< i len)
-             (if (or first (>= (- t t_start) period))
-                 (begin
-                   (if first
-                       (set! first #f)
-                       ;; else
-                       (while (>= (- t t_start) period)
-                              (set! t_start (+ t_start period))))
-                   (cond
-                    [(< t D_attack)
-                     (set! amplitude    (* (/    A_attack            D_attack) t))
-                     (set! frequency (+ (* (/ (- F_attack F_initial) D_attack) t) F_initial))]
-                    [(< t (+ D_attack D_decay))
-                     (set! amplitude (+ (* (/ (- A_sustain A_attack) D_decay) (- t D_attack)) A_attack))
-                     (set! frequency (+ (* (/ (- F_sustain F_attack) D_decay) (- t D_attack)) F_attack))]
-                    [(< t (+ D_attack D_decay D_sustain))
-                     (set! amplitude A_sustain)
-                     (set! frequency F_sustain)]
-                    [(< t D_total)
-                     (set! amplitude (+ (* (/ (- 0         A_sustain) D_release) (- t D_attack D_decay D_sustain)) A_sustain))
-                     (set! frequency (+ (* (/ (- F_release F_sustain) D_release) (- t D_attack D_decay D_sustain)) F_sustain))]
-                    [else
-                     (set! amplitude 0)
-                     (set! frequency F_release)])
 
-                   ;; Apply the MIDI controller curves.
-                   (set! amplitude (* amplitude (gain-at t)))
-                   (set! frequency (* frequency (expt 2.0 (/ (pitch-offset t) 12.0))))
-                   (set! period (/ 1.0 frequency))
+    (define (level amplitude)
+      ;; Noise voices flip the sign of each half-period at random.
+      (let ([v (* amplitude MAX)])
+        (if (and noisy (zero? (random 2))) (- v) v)))
 
-                   (if (= noise 1)
-                       (begin
-                         (if (zero? (random 2))
-                             (set! level-a (inexact->exact (round (* amplitude MAX))))
-                             (set! level-a (inexact->exact (round (- (* amplitude MAX))))))
-                         (if (zero? (random 2))
-                             (set! level-b (inexact->exact (round (* amplitude MAX))))
-                             (set! level-b (inexact->exact (round (- (* amplitude MAX)))))))
-                       (begin
-                         (set! level-a (inexact->exact (round (* amplitude MAX))))
-                         (set! level-b (inexact->exact (round (- (* amplitude MAX)))))))))
+    (define (boundary t t_start period first)
+      ;; At the start of each waveform period, recompute the envelope,
+      ;; apply the controller curves and return
+      ;; (values t_start period level-a level-b).
+      (let ([t_start (if first
+                         t_start
+                         (let advance ([ts t_start])
+                           (if (>= (- t ts) period) (advance (+ ts period)) ts)))])
+        (let-values
+            ([(amplitude frequency)
+              (cond
+               [(< t D_attack)
+                (values (* (/ A_attack D_attack) t)
+                        (+ (* (/ (- F_attack F_initial) D_attack) t) F_initial))]
+               [(< t D_ad)
+                (values (+ (* (/ (- A_sustain A_attack) D_decay) (- t D_attack)) A_attack)
+                        (+ (* (/ (- F_sustain F_attack) D_decay) (- t D_attack)) F_attack))]
+               [(< t D_ads)
+                (values A_sustain F_sustain)]
+               [(< t D_total)
+                (values (+ (* (/ (- 0.0 A_sustain) D_release) (- t D_attack D_decay D_sustain)) A_sustain)
+                        (+ (* (/ (- F_release F_sustain) D_release) (- t D_attack D_decay D_sustain)) F_sustain))]
+               [else (values 0.0 F_release)])])
+          (let* ([amplitude (* amplitude (gain-at t))]
+                 [frequency (* frequency (expt 2.0 (/ (pitch-offset t) 12.0)))]
+                 [la (if noisy (level amplitude) (* amplitude MAX))]
+                 [lb (if noisy (level amplitude) (- (* amplitude MAX)))])
+            (values t_start (/ 1.0 frequency) la lb)))))
 
-             (if (< (- t t_start) (* period duty))
-                 (if (eqv? waveform 0)
-                     (bytevector-s16-native-set! buf (* i 2) level-a)
-                     (bytevector-s16-native-set! buf (* i 2)
-                                                 (inexact->exact
-                                                  (round
-                                                   (* level-a (sin (/ (* PI (- t t_start))
-                                                                      (* period duty))))))))
-                 ;; else
-                 (if (eqv? waveform 0)
-                     (bytevector-s16-native-set! buf (* i 2) level-b)
-                     (bytevector-s16-native-set! buf (* i 2)
-                                                 (inexact->exact (round
-                                                                  (* level-b
-                                                                     (sin (/ (* PI (- t t_start (* period duty)))
-                                                                             (* period (1- duty))))))))))
+    (define (update-pan! i)
+      ;; Apply every pan point at or before sample I (time i/sr, as
+      ;; the step curve is sampled) and return the time of the next.
+      (let loop ()
+        (when (and (pair? pan-rest) (<= (caar pan-rest) (/ i sr)))
+          (set! pan-gains-now (cdar pan-rest))
+          (set! pan-rest (cdr pan-rest))
+          (loop)))
+      (if (pair? pan-rest) (exact->inexact (caar pan-rest)) +inf.0))
 
-             (set! i (1+ i))
-             (set! t (+ t (/ 1.0 (sample-rate)))))
-      buf)))
+    ;; Render one waveform period at a time.  Each period's constants
+    ;; go into a small f64 scratch bytevector and are read back before
+    ;; the inner loop: values read that way are known to be floats, so
+    ;; Guile's compiler keeps the per-sample arithmetic unboxed.  The
+    ;; inner loop also stops at the next pan point, so a pan change
+    ;; takes effect on its exact sample without disturbing the wave.
+    (let ([st (make-bytevector (* 8 10))])
+      (define-syntax-rule (st-ref k) (bytevector-ieee-double-native-ref st (* 8 k)))
+      (define-syntax-rule (st-set! k v) (bytevector-ieee-double-native-set! st (* 8 k) v))
+      (st-set! 0 dt)
+      (st-set! 6 duty)
+      (st-set! 8 sr)
+      (let outer ([i 0] [t_start 0.0] [period 0.0] [first #t] [pan-only #f])
+        (when (< i len)
+          (let-values ([(ts p a b) (if pan-only
+                                       (values t_start period (st-ref 3) (st-ref 4))
+                                       (boundary (* i dt) t_start period first))])
+            (let ([next-pan (update-pan! i)])
+              (st-set! 1 ts)
+              (st-set! 2 p)
+              (st-set! 3 a)
+              (st-set! 4 b)
+              (st-set! 5 (if stereo (car pan-gains-now) 1.0))
+              (st-set! 7 (if stereo (cdr pan-gains-now) 0.0))
+              (st-set! 9 next-pan))
+            (let ([next
+                   (let ([dt (st-ref 0)] [ts (st-ref 1)] [p (st-ref 2)]
+                         [la (st-ref 3)] [lb (st-ref 4)] [gl (st-ref 5)]
+                         [duty (st-ref 6)] [gr (st-ref 7)] [sr (st-ref 8)]
+                         [next-pan (st-ref 9)])
+                     (let* ([high-len (* p duty)]
+                            [low-len (* p (- duty 1.0))])
+                       ;; Samples up to the end of this period or the
+                       ;; next pan point, whichever comes first.
+                       (let inner ([j i])
+                         (if (>= j len)
+                             j
+                             (let ([phase (- (* j dt) ts)])
+                               (if (and (> j i)
+                                        (or (>= phase p) (>= (/ j sr) next-pan)))
+                                   j
+                                   (let ([s (cond
+                                             [(< phase high-len)
+                                              (if square la
+                                                  (* la (sin (/ (* PI phase) high-len))))]
+                                             [square lb]
+                                             [else (* lb (sin (/ (* PI (- phase high-len))
+                                                                 low-len)))])]
+                                         [offset (* 4 nch (+ start-frame j))])
+                                     (bytevector-ieee-single-native-set!
+                                      bus offset
+                                      (+ (bytevector-ieee-single-native-ref bus offset) (* s gl)))
+                                     (when stereo
+                                       (let ([offset (+ offset 4)])
+                                         (bytevector-ieee-single-native-set!
+                                          bus offset
+                                          (+ (bytevector-ieee-single-native-ref bus offset)
+                                             (* s gr)))))
+                                     (inner (1+ j)))))))))])
+              ;; If the period has not ended, only the pan changed.
+              (outer next ts p #f
+                     (< (- (* next dt) ts) p)))))))))
 
 (define (instrument-row table name)
   (or (find (lambda (entry) (eqv? (car entry) name)) table)
@@ -199,99 +273,60 @@ release) the release phase.  0 means no release velocity was sent."
       (- 1.5 (/ velocity-end 127.0))
       1.0))
 
-(define (GenerateTone note)
-  (let* ([instrumentData (instrument-row tuned (vector-ref gm-families
-                                                           (quotient (note-patch note) 8)))]
+(define (GenerateTone bus start-frame nch note)
+  (let* ([row (list->vector (instrument-row tuned (vector-ref gm-families
+                                                              (quotient (note-patch note) 8))))]
          [duration (note-duration note)]
          [velocity (note-velocity-begin note)]
-         [d_attack (list-ref instrumentData 1)]
-         [d_decay (list-ref instrumentData 2)]
+         [d_attack (vector-ref row 1)]
+         [d_decay (vector-ref row 2)]
          [d_sustain 0]
-         [d_release (* (list-ref instrumentData 3)
-                       (release-scale (note-velocity-end note)))]
+         [d_release (* (vector-ref row 3) (release-scale (note-velocity-end note)))]
          ;; Pitch bend and tuning are applied through the pitch curve.
-         [freq (* 440 (expt 2.0 (/ (- (note-key note) 69) 12.0)))]
-         [a1 (/ (* velocity (list-ref instrumentData 4)) 127)]
-         [a2 (/ (* velocity (list-ref instrumentData 5)) 127)]
-         [f1 (* freq (list-ref instrumentData 6))]
-         [f2 (* freq (list-ref instrumentData 7))]
-         [f3 freq]
-         [f4 (* freq (list-ref instrumentData 8))]
-         [wav (list-ref instrumentData 9)]
-         [duty (list-ref instrumentData 10)])
+         [freq (* 440 (expt 2.0 (/ (- (note-key note) 69) 12.0)))])
     ;; Fit the attack/decay/sustain phases to the note's duration.
     (cond
      [(<= duration d_attack) (set! d_decay 0)]
      [(<= duration (+ d_attack d_decay)) (set! d_decay (- duration d_attack))]
      [else (set! d_sustain (- duration d_attack d_decay))])
-    (GeneratePCM d_attack d_decay d_sustain d_release f1 f2 f3 f4 a1 a2 duty 0 wav
+    (GeneratePCM bus start-frame nch
+                 d_attack d_decay d_sustain d_release
+                 (* freq (vector-ref row 6)) (* freq (vector-ref row 7))
+                 freq (* freq (vector-ref row 8))
+                 (/ (* velocity (vector-ref row 4)) 127)
+                 (/ (* velocity (vector-ref row 5)) 127)
+                 (vector-ref row 10) 0 (vector-ref row 9)
                  #:pitch-curve (note-pitch-curve note)
                  #:gain-curve (note-gain-curve note)
                  #:mod-curve (note-mod-curve note)
-                 #:glide (note-glide note))))
+                 #:glide (note-glide note)
+                 #:pan-curve (note-pan-curve note)
+                 #:stop (note-stop note))))
 
-(define (GenerateNoise note)
+(define (GenerateNoise bus start-frame nch note)
   (let* ([instrument (or (assv-ref gm-drums (note-key note)) 'OTHER)]
-         [instrumentData (instrument-row untuned instrument)]
+         [row (list->vector (instrument-row untuned instrument))]
          [velocity (note-velocity-begin note)])
-    (let ([d_attack (list-ref instrumentData 1)]
-          [d_decay (list-ref instrumentData 2)]
-          [d_sustain (list-ref instrumentData 3)]
-          [d_release (list-ref instrumentData 4)]
-          [a1 (/ (* velocity (list-ref instrumentData 5)) 127)]
-          [a2 (/ (* velocity (list-ref instrumentData 6)) 127)]
-          [f1 (list-ref instrumentData 7)]
-          [f2 (list-ref instrumentData 8)]
-          [f3 (list-ref instrumentData 9)]
-          [f4 (list-ref instrumentData 10)]
-          [wav (list-ref instrumentData 11)]
-          [duty (list-ref instrumentData 12)])
-      ;; Percussion ignores pitch bend and vibrato but follows volume.
-      (GeneratePCM d_attack d_decay d_sustain d_release f1 f2 f3 f4 a1 a2 duty 1 wav
-                   #:gain-curve (note-gain-curve note)))))
+    ;; Percussion ignores pitch bend and vibrato but follows volume
+    ;; and pan.
+    (GeneratePCM bus start-frame nch
+                 (vector-ref row 1) (vector-ref row 2) (vector-ref row 3) (vector-ref row 4)
+                 (vector-ref row 7) (vector-ref row 8) (vector-ref row 9) (vector-ref row 10)
+                 (/ (* velocity (vector-ref row 5)) 127)
+                 (/ (* velocity (vector-ref row 6)) 127)
+                 (vector-ref row 12) 1 (vector-ref row 11)
+                 #:gain-curve (note-gain-curve note)
+                 #:pan-curve (note-pan-curve note)
+                 #:stop (note-stop note))))
 
-;; Saturate rather than overflow when many voices pile up.
-(define (mix! wav offset sample)
-  (bytevector-s16-set! wav offset
-                       (max -32768
-                            (min 32767
-                                 (+ (bytevector-s16-ref wav offset (endianness little))
-                                    sample)))
-                       (endianness little)))
-
-(define (AddNoteWaveform! wav note)
-  "Mix NOTE into WAV, a little-endian 16-bit buffer holding
-(output-channels) interleaved channels."
-  (let* ([sr (sample-rate)]
-         [nch (output-channels)]
-         [frame-bytes (* 2 nch)]
-         [start-frame (inexact->exact (floor (* (note-time note) sr)))]
-         [pcm (if (note-percussion note)
-                  (GenerateNoise note)
-                  (GenerateTone note))]
-         [pcm-frames (quotient (bytevector-length pcm) 2)]
-         ;; All Sound Off cuts the note dead at its stop time.
-         [limit (let ([stop (note-stop note)])
-                  (if stop
-                      (min pcm-frames (inexact->exact (floor (* stop sr))))
-                      pcm-frames))]
-         [frames (min limit (- (quotient (bytevector-length wav) frame-bytes)
-                               start-frame))])
-    (if (= nch 1)
-        (do ([k 0 (1+ k)])
-            ((>= k frames))
-          (mix! wav (* 2 (+ start-frame k))
-                (bytevector-s16-ref pcm (* 2 k) (native-endianness))))
-        ;; Stereo: the pan curve is a step function, so only
-        ;; recompute the gains when it moves.
-        (let ([pan-at (make-step-reader (note-pan-curve note) (pan-gains 64 64))])
-          (do ([k 0 (1+ k)])
-              ((>= k frames))
-            (let* ([gains (pan-at (/ k (exact->inexact sr)))]
-                   [s (bytevector-s16-ref pcm (* 2 k) (native-endianness))]
-                   [offset (* frame-bytes (+ start-frame k))])
-              (mix! wav offset (inexact->exact (round (* s (car gains)))))
-              (mix! wav (+ offset 2) (inexact->exact (round (* s (cdr gains)))))))))))
+(define (AddNoteWaveform! bus note)
+  "Mix NOTE into BUS, a float mix bus with (output-channels)
+interleaved channels."
+  (let ([start-frame (inexact->exact (floor (* (note-time note) (sample-rate))))]
+        [nch (output-channels)])
+    (if (note-percussion note)
+        (GenerateNoise bus start-frame nch note)
+        (GenerateTone bus start-frame nch note))))
 
 (define (FindDuration noteList)
   "Length of the song in seconds, allowing for release tails."
@@ -299,27 +334,49 @@ release) the release phase.  0 means no release velocity was sent."
           (max end (+ (note-time n) (note-duration n) 1.0)))
         0 noteList))
 
+(define (bus->s16 bus nch)
+  "Convert the float mix bus to little-endian 16-bit PCM, saturating
+at the 16-bit limits and dropping trailing silence (whole frames)."
+  (let* ([samples (quotient (bytevector-length bus) 4)]
+         ;; Anything under half a step rounds to zero.
+         [audible? (lambda (j)
+                     (> (abs (bytevector-ieee-single-native-ref bus (* 4 j))) 0.5))]
+         ;; Index just past the last audible sample, rounded up to a
+         ;; whole frame.
+         [end (let scan ([j (1- samples)])
+                (cond
+                 [(< j 0) 0]
+                 [(audible? j) (* nch (1+ (quotient j nch)))]
+                 [else (scan (1- j))]))]
+         [out (make-bytevector (* 2 end))]
+         ;; Float-to-integer without generic arithmetic: adding
+         ;; 1.5 * 2^52 to a double leaves round-half-even(x) in the
+         ;; low bits of its bit pattern (exact for |x| < 2^31), which
+         ;; are then read back as a 16-bit integer.  This matches
+         ;; (inexact->exact (round x)) and keeps the loop unboxed.
+         [scratch (make-bytevector 8)]
+         [low (if (eq? (native-endianness) (endianness little)) 0 6)])
+    (let loop ([j 0])
+      (when (< j end)
+        (let ([x (bytevector-ieee-single-native-ref bus (* 4 j))])
+          (bytevector-ieee-double-native-set!
+           scratch 0 (+ (cond [(> x 32767.0) 32767.0]
+                              [(< x -32768.0) -32768.0]
+                              [else x])
+                        6755399441055744.0))
+          (bytevector-s16-set! out (* 2 j) (bytevector-s16-native-ref scratch low)
+                               (endianness little)))
+        (loop (1+ j))))
+    out))
+
 (define (NoteList->PCM noteList)
   "Given a list of notes, generate a little-endian 16-bit PCM buffer
 using an 8-bit-style soft synth.  The buffer has (output-channels)
 interleaved channels at (sample-rate)."
-  (let* ([duration (FindDuration noteList)]
-         [frames (inexact->exact (ceiling (* duration (sample-rate))))]
-         [frame-bytes (* 2 (output-channels))]
-         [wav (make-bytevector (* frame-bytes frames) 0)])
-    (for-each (lambda (note) (AddNoteWaveform! wav note)) noteList)
-    ;; Drop the silence left over from padding for release tails,
-    ;; trimming whole frames.
-    (define (silent-frame? end)
-      (let loop ([i (- end frame-bytes)])
-        (or (>= i end)
-            (and (zero? (bytevector-s16-ref wav i (endianness little)))
-                 (loop (+ i 2))))))
-    (let loop ([n (bytevector-length wav)])
-      (if (and (> n 0) (silent-frame? n))
-          (loop (- n frame-bytes))
-          (if (= n (bytevector-length wav))
-              wav
-              (let ([out (make-bytevector n)])
-                (bytevector-copy! wav 0 out 0 n)
-                out))))))
+  (let* ([nch (output-channels)]
+         [frames (inexact->exact (ceiling (* (FindDuration noteList) (sample-rate))))]
+         ;; The whole song's mix bus, allocated once and zero-filled
+         ;; (all-zero bytes are 0.0 as IEEE floats).
+         [bus (make-bytevector (* 4 nch frames) 0)])
+    (for-each (lambda (note) (AddNoteWaveform! bus note)) noteList)
+    (bus->s16 bus nch)))

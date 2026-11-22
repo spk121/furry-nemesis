@@ -1,4 +1,4 @@
-#!/usr/bin/env -S guile --no-auto-compile -e main -s
+#!/usr/bin/env -S guile -e main -s
 !#
 ;;; main.scm -- command-line front end for the furry-nemesis MIDI
 ;;; chiptune renderer.

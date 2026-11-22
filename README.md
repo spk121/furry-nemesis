@@ -5,9 +5,11 @@ Hi.  This program renders a MIDI file into a stereo WAV file. Run
 `./main.scm song.mid` to write `song.wav`; `potluck2014.scm` renders
 "tmp.midi" into "tmp.wav".
 
-It is really slow.  Sorry about that.  I'm using a primitive method to
-generate the wav files, keeping too much data in memory.  I'll make it
-more efficient when I get some spare time.
+Rendering is reasonably quick: a one-minute, four-track song takes
+about a second.  Every voice is mixed straight into one preallocated
+floating-point buffer for the whole song (about 21 MB per stereo
+minute), which is converted to 16-bit PCM once at the end.  The first
+run is slower because Guile compiles the modules and caches them.
 
 ## Command-line usage
 
@@ -58,4 +60,4 @@ for what a chiptune renderer can't reproduce, such as reverb.
 
 Run the tests with:
 
-    guile --no-auto-compile test-midi-1.1.scm
+    guile test-midi-1.1.scm
