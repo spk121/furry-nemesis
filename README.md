@@ -2,8 +2,7 @@ furry-nemesis
 =============
 
 Hi.  This program renders a MIDI file into a stereo WAV file. Run
-`./main.scm song.mid` to write `song.wav`; `potluck2014.scm` renders
-"tmp.midi" into "tmp.wav".
+`./main.scm song.mid` to write `song.wav`.
 
 Rendering is reasonably quick: a one-minute, four-track song takes
 about a second.  Every voice is mixed straight into one preallocated
@@ -35,7 +34,7 @@ run is slower because Guile compiles the modules and caches them.
 | `-v`, `--verbose` / `-q`, `--quiet` | more or less progress output |
 | `-h`, `--help` / `-V`, `--version` | help and version |
 
-`potluck2014.scm` still renders `tmp.midi` to `tmp.wav` with no options.
+With no input argument, `main.scm` reads `tmp.midi` and writes `tmp.wav`.
 
 ## MIDI 1.1 Support
 

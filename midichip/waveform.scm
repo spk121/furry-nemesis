@@ -1,6 +1,6 @@
-(define-module (mlg waveform)
+(define-module (midichip waveform)
   #:use-module (ice-9 optargs)
-  #:use-module (mlg notelist)
+  #:use-module (midichip notelist)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)

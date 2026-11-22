@@ -7,9 +7,9 @@
 ;;; Run with --help for the full list of options.
 
 (add-to-load-path (dirname (current-filename)))
-(use-modules (mlg midi)
-             (mlg waveform)
-             (mlg notelist)
+(use-modules (midichip midi)
+             (midichip waveform)
+             (midichip notelist)
              (srfi srfi-1)
              (ice-9 getopt-long)
              (ice-9 format)

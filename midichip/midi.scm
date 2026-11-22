@@ -1,4 +1,4 @@
-;;; (mlg midi) -- Standard MIDI File parser (MIDI 1.0 / SMF 1.1)
+;;; (midichip midi) -- Standard MIDI File parser (MIDI 1.0 / SMF 1.1)
 ;;;
 ;;; ParseMidi returns a time-sorted list of events.  Every event is a
 ;;; list whose head is a symbol naming the event, followed by keyword
@@ -14,7 +14,7 @@
 ;;; MidiEvents->TempoMap returns a single 1-second-per-quarter entry,
 ;;; so the usual tick-to-seconds conversion yields absolute time.
 
-(define-module (mlg midi)
+(define-module (midichip midi)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
   #:use-module (rnrs io ports)

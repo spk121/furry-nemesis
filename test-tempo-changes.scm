@@ -3,8 +3,8 @@
 ;;; Test script to verify MIDI 1.1 tempo change functionality
 
 (add-to-load-path (dirname (current-filename)))
-(use-modules (mlg midi)
-             (mlg notelist)
+(use-modules (midichip midi)
+             (midichip notelist)
              (ice-9 binary-ports)
              (ice-9 optargs)
              (rnrs bytevectors)

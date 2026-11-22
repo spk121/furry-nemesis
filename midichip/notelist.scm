@@ -1,4 +1,4 @@
-;;; (mlg notelist) -- turn MIDI events into a list of renderable notes
+;;; (midichip notelist) -- turn MIDI events into a list of renderable notes
 ;;;
 ;;; MidiEvents->NoteList runs a model of a MIDI 1.0 receiver with 16
 ;;; channels over the event list.  It tracks every channel's program,
@@ -31,7 +31,7 @@
 ;;; and seconds relative to the note's start after
 ;;; NormalizeNoteListTimes!.
 
-(define-module (mlg notelist)
+(define-module (midichip notelist)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-9)

@@ -1,15 +1,15 @@
 #!/usr/bin/guile
 !#
 ;;; Tests for MIDI 1.0 / SMF 1.1 conformance of the parser, the
-;;; receiver model in (mlg notelist) and the synthesizer.
+;;; receiver model in (midichip notelist) and the synthesizer.
 ;;;
 ;;; Run with:  guile test-midi-1.1.scm
 ;;; Exits with status 0 when every check passes.
 
 (add-to-load-path (dirname (current-filename)))
-(use-modules (mlg midi)
-             (mlg notelist)
-             (mlg waveform)
+(use-modules (midichip midi)
+             (midichip notelist)
+             (midichip waveform)
              (srfi srfi-1)
              (ice-9 optargs)
              (rnrs bytevectors)

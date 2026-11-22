@@ -3,8 +3,8 @@
 ;;; Test script to verify MIDI 1.1 parsing functionality
 
 (add-to-load-path (dirname (current-filename)))
-(use-modules (mlg midi)
-             (mlg notelist)
+(use-modules (midichip midi)
+             (midichip notelist)
              (ice-9 binary-ports)
              (rnrs bytevectors)
              (rnrs io ports))

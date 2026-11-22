@@ -1,6 +1,6 @@
 ;; Helper functions for binary ports
 
-(define-module (mlg binports)
+(define-module (midichip binports)
   :use-module (rnrs io ports)
   :use-module (rnrs bytevectors)
   :export (get-s8

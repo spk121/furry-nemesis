@@ -10,9 +10,9 @@ The code is split into three layers:
 
 | Module | Role |
 | --- | --- |
-| `mlg/midi.scm` | Standard MIDI File parser: bytes to a time-sorted event list |
-| `mlg/notelist.scm` | A 16-channel MIDI receiver model: events to notes with controller curves |
-| `mlg/waveform.scm` | Chiptune synthesizer: notes to 16-bit stereo (or mono) PCM |
+| `midichip/midi.scm` | Standard MIDI File parser: bytes to a time-sorted event list |
+| `midichip/notelist.scm` | A 16-channel MIDI receiver model: events to notes with controller curves |
+| `midichip/waveform.scm` | Chiptune synthesizer: notes to 16-bit stereo (or mono) PCM |
 
 ## File format (parser)
 
