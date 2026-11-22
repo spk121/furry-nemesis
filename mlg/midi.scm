@@ -7,7 +7,12 @@
   :use-module (ice-9 optargs)
   :export (ParseMidi
 	   ParseMidiFile
-           MidiEvents->TempoMap))
+           MidiEvents->TempoMap
+           midi-trace))
+
+;; When true, the parser prints the track count and every event as it
+;; is read.  Useful for debugging; off by default.
+(define midi-trace (make-parameter #f))
 
 (define V_NOTE_OFF #x80)
 (define V_NOTE_ON #x90)
@@ -180,7 +185,7 @@ expected.  Variable length integers never have more than 4 bytes."
      [else
       (do ([i 0 (1+ i)]) ([= i byte2])
           (get-u8 port))
-      (format #t "Unhandled meta event ~a len ~a~%" byte1 byte2)
+      (format (current-error-port) "Unhandled meta event ~a len ~a~%" byte1 byte2)
       (list 'META #:channel channel #:byte1 byte1)])))
 
 
@@ -360,7 +365,7 @@ expected.  Variable length integers never have more than 4 bytes."
 	       #:channel (_LoVal status)
 	       #:value (logior (ash hi 7) lo)))]
       [else
-       (format #t "Unhandled event~a~%" status)
+       (format (current-error-port) "Unhandled event ~a~%" status)
        (list 'JUNK)]))))
 
 (define (ParseTrack port trackID ticksPerQuarter)
@@ -387,7 +392,8 @@ expected.  Variable length integers never have more than 4 bytes."
 		    (list #:time now)	; Time since beginning of song
 		    (list #:track trackID)
 		    (cdr event)))	; The details of the event
-	     (display "E: ") (write event) (newline)
+	     (when (midi-trace)
+	       (display "E: ") (write event) (newline))
 	     (set! eventList
 		   (append! eventList (list event)))
              (when (eqv? 'END_OF_TRACK (car event))
@@ -409,7 +415,8 @@ expected.  Variable length integers never have more than 4 bytes."
     (< (_ExtractTime a) (_ExtractTime b)))
   
   (let-values ([(midiFormat trackCount ticksPerQuarter) (ParseHeader port)])
-    (format #t "Track Count: ~a~%" trackCount)
+    (when (midi-trace)
+      (format #t "Track Count: ~a~%" trackCount))
     (let ([midiEvents '()])
       ;; Add a fake MIDI event with the header data, mostly because we
       ;; need ticksPerQuarter

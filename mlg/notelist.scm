@@ -17,7 +17,12 @@
            note-pitch-bend
 
            MidiEvents->NoteList
-           NormalizeNoteListTimes!))
+           NormalizeNoteListTimes!
+           default-tempo))
+
+;; Microseconds per quarter note used when a MIDI file contains no
+;; SET_TEMPO events.  500000 is the MIDI default of 120 BPM.
+(define default-tempo (make-parameter 500000))
 
 ;; The final information for a note, after all the mergin, is this...
 (define (note-time n) (list-ref n 0))
@@ -134,7 +139,7 @@ noteList from MIDI ticks to microseconds, properly handling tempo changes."
               "Convert a tick value to seconds, accounting for tempo changes."
               (if (or (null? tempoMap) (= (length tempoMap) 0))
                   ;; Default tempo: 120 BPM = 500000 microseconds per quarter note
-                  (let ([msPerTick (exact->inexact (/ 500000 ticksPerQuarterNote))])
+                  (let ([msPerTick (exact->inexact (/ (default-tempo) ticksPerQuarterNote))])
                     (* targetTick msPerTick 1e-6))
                   ;; else: walk through tempo changes
                   (let loop ([currentTick 0]

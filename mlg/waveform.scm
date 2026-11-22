@@ -3,9 +3,17 @@
   :use-module (mlg notelist)
   :use-module (rnrs bytevectors)
   :use-module (srfi srfi-1)
-  :export (NoteList->PCM))
+  :export (NoteList->PCM
+           sample-rate
+           pitch-bend-range))
 
-(define SAMPLE_RATE 44100)
+;; Output sample rate in Hz.  A parameter so callers can override it
+;; with `parameterize'.
+(define sample-rate (make-parameter 44100))
+
+;; Pitch wheel range in semitones (each direction).  The General MIDI
+;; default is +/- 2 semitones.
+(define pitch-bend-range (make-parameter 2.0))
 (define MAX #x7FF)
 
 (define tuned
@@ -51,7 +59,7 @@
                      A_attack A_sustain duty noise waveform)
   "Given an ADSR envelope, generate a waveform (12-bit signed)"
   (let* ([D_total (+ D_attack D_decay D_sustain D_release)]
-         [len (inexact->exact (ceiling (* D_total SAMPLE_RATE)))]
+         [len (inexact->exact (ceiling (* D_total (sample-rate))))]
          [buf (make-bytevector (* len 2))])
     (let ([t 0.0] [t_start 0.0]
           [i 0]
@@ -122,7 +130,7 @@
                                                                              (* period (1- duty))))))))))
              
              (set! i (1+ i))
-             (set! t (+ t (/ 1.0 SAMPLE_RATE))))
+             (set! t (+ t (/ 1.0 (sample-rate)))))
       buf)))
 
 (define (GenerateTone time instrument note duration velocity pitch-bend)
@@ -136,8 +144,7 @@
            [d_sustain 0]
            [d_release (list-ref instrumentData 3)]
            ;; Convert pitch bend from 0-16383 (center 8192) to semitone offset
-           ;; Standard MIDI pitch bend range is ±2 semitones
-           [bend-semitones (* 2.0 (/ (- pitch-bend 8192) 8192.0))]
+           [bend-semitones (* (pitch-bend-range) (/ (- pitch-bend 8192) 8192.0))]
            [freq (* 440 (expt 2.0 (/ (+ (- note 69) bend-semitones) 12.0)))]
            [a1 (/ (* velocity (list-ref instrumentData 4)) 127)]
            [a2 (/ (* velocity (list-ref instrumentData 5)) 127)]
@@ -188,7 +195,7 @@
           [velocity-begin (note-velocity-begin note)]
           [velocity-end (note-velocity-end note)]
           [pitch-bend (note-pitch-bend note)])
-      (set! start (* 2 (inexact->exact (floor (* time SAMPLE_RATE)))))
+      (set! start (* 2 (inexact->exact (floor (* time (sample-rate))))))
       (if (not percussion)
           (begin 
             (cond
@@ -251,12 +258,8 @@
   "Given a list of notes, generate PCM waveform using an 8-bit-style
 soft synth."
   (let* ([duration (FindDuration noteList)]
-         [samples (inexact->exact (ceiling (* duration SAMPLE_RATE)))]
+         [samples (inexact->exact (ceiling (* duration (sample-rate))))]
          [wav (make-bytevector (* 2 samples) 0)])
-    (let loop ([currentNote (car noteList)]
-               [remainingNotes (cdr noteList)])
-      (AddNoteWaveform! wav currentNote)
-      (if (not (null? remainingNotes))
-          (loop (car remainingNotes) (cdr remainingNotes))
-          wav))))
+    (for-each (lambda (note) (AddNoteWaveform! wav note)) noteList)
+    wav))
 
