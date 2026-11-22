@@ -1,9 +1,9 @@
 #!/usr/bin/env -S guile -e main -s
 !#
-;;; main.scm -- command-line front end for the furry-nemesis MIDI
+;;; midichip.scm -- command-line front end for the furry-nemesis MIDI
 ;;; chiptune renderer.
 ;;;
-;;; Usage: ./main.scm [OPTION]... [INPUT.mid]
+;;; Usage: ./midichip.scm [OPTION]... [INPUT.mid]
 ;;; Run with --help for the full list of options.
 
 (add-to-load-path (dirname (current-filename)))
@@ -17,7 +17,7 @@
              (rnrs io ports)
              (rnrs bytevectors))
 
-(define program-name "furry-nemesis")
+(define program-name "midichip")
 (define program-version "0.2")
 
 (define default-input "tmp.midi")

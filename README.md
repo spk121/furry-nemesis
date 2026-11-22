@@ -2,7 +2,7 @@ furry-nemesis
 =============
 
 Hi.  This program renders a MIDI file into a stereo WAV file. Run
-`./main.scm song.mid` to write `song.wav`.
+`./midichip.scm song.mid` to write `song.wav`.
 
 Rendering is reasonably quick: a one-minute, four-track song takes
 about a second.  Every voice is mixed straight into one preallocated
@@ -12,12 +12,12 @@ run is slower because Guile compiles the modules and caches them.
 
 ## Command-line usage
 
-`main.scm` is a command-line front end with GNU-style long options:
+`midichip.scm` is a command-line front end with GNU-style long options:
 
-    ./main.scm song.mid                 # writes song.wav
-    ./main.scm -o out.wav -r 22050 song.mid
-    ./main.scm --no-drums -b 12 song.mid
-    ./main.scm -n --dump-notes song.mid # analyse only, no audio
+    ./midichip.scm song.mid                 # writes song.wav
+    ./midichip.scm -o out.wav -r 22050 song.mid
+    ./midichip.scm --no-drums -b 12 song.mid
+    ./midichip.scm -n --dump-notes song.mid # analyse only, no audio
 
 | Option | Meaning |
 |---|---|
@@ -34,7 +34,7 @@ run is slower because Guile compiles the modules and caches them.
 | `-v`, `--verbose` / `-q`, `--quiet` | more or less progress output |
 | `-h`, `--help` / `-V`, `--version` | help and version |
 
-With no input argument, `main.scm` reads `tmp.midi` and writes `tmp.wav`.
+With no input argument, `midichip.scm` reads `tmp.midi` and writes `tmp.wav`.
 
 ## MIDI 1.1 Support
 
